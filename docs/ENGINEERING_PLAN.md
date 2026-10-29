@@ -106,8 +106,11 @@ These are study references, not dependencies to copy blindly. Check each project
 
 ## First implementation tasks
 
-1. Make progress demo data explicitly opt-in and prevent simulated sessions from entering normal user history.
-2. Add baseline test infrastructure and tests for frequency/MIDI conversion, note formatting, pitch detection on synthetic tones/noise/octave-rich signals, and audio export.
-3. Correct scoring semantics: confidence-gated voiced frames, reference-target comparison, and no hard-coded default accuracy/vibrato values presented as measured results.
-4. Make AI fallback/error status explicit; validate request and response payloads.
-5. Add README and CI before broad refactors.
+- [x] Remove seeded progress from the normal learner history, clean known prototype fixtures from local storage, remove the simulated-session button, and prevent simulator sessions from being saved as measured progress.
+- [x] Add baseline test infrastructure and initial tests for frequency/MIDI conversion, note formatting, pitch detection on synthetic tones, and silence/noise-floor rejection.
+- [x] Add README setup instructions and CI for dependency installation, typecheck, unit tests, and production build.
+- [ ] Verify the CI result and fix any baseline typecheck/build/test failures before merging.
+- [ ] Correct scoring semantics: confidence-gated voiced frames, reference-target comparison, and no hard-coded default accuracy/vibrato values presented as measured results.
+- [ ] Make AI fallback/error status explicit; validate request and response payloads.
+- [ ] Audit the microphone lifecycle, browser compatibility, and the real DSP implementation against the controls advertised in the studio.
+- [ ] Add annotated-singing dataset evaluation and publish pitch error, octave-error rate, voiced/unvoiced performance, and latency.
