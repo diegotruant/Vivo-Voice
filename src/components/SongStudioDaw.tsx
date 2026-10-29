@@ -93,17 +93,20 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
   // Live Telemetry during Vocal Recording
   const [liveNoteLabel, setLiveNoteLabel] = useState<string>("—");
   const [liveCents, setLiveCents] = useState<number | null>(null);
-  const [liveAccuracy, setLiveAccuracy] = useState<number>(84);
-  const [liveStability, setLiveStability] = useState<number>(82);
-  const [avgCentsDev, setAvgCentsDev] = useState<number>(-6);
+  const [liveAccuracy, setLiveAccuracy] = useState<number>(0);
+  const [liveStability, setLiveStability] = useState<number>(0);
+  const [avgCentsDev, setAvgCentsDev] = useState<number>(0);
+  const [hasVocalMetrics, setHasVocalMetrics] = useState<boolean>(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [isDemoTake, setIsDemoTake] = useState<boolean>(false);
   const [vibratoStats, setVibratoStats] = useState<{
     rateHz: number;
     extentCents: number;
     label: string;
-  }>({ rateHz: 5.6, extentCents: 38, label: "Vibrato Naturale" });
+  }>({ rateHz: 0, extentCents: 0, label: "Non misurato" });
   const [weakPassages, setWeakPassages] = useState<WeakPassageRecord[]>([]);
-  const [minSungNote, setMinSungNote] = useState<string>("Do3");
-  const [maxSungNote, setMaxSungNote] = useState<string>("Sol4");
+  const [minSungNote, setMinSungNote] = useState<string>("—");
+  const [maxSungNote, setMaxSungNote] = useState<string>("—");
 
   // AI Vocal Coach Diagnostic & Mastering Parameters
   const [isAnalyzingAi, setIsAnalyzingAi] = useState<boolean>(false);
@@ -396,8 +399,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
                 `al secondo ${p.timeSec.toFixed(1)}s sulla nota ${p.noteLabel}: ${p.issue} (${p.centsOff > 0 ? `+${p.centsOff}` : p.centsOff} cent)`
             )
           : [
-              "Lieve calo di sostegno diaframmatico nei finali di frase (circa -16 cent)",
-              "Transizione sul passaggio verso le note acute con laringe leggermente alta",
+              "Nessun passaggio critico oltre soglia è stato registrato nei dati disponibili.",
             ];
 
       const res = await fetch("/api/vocal-coach/song-analyze", {
@@ -436,6 +438,16 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
   // Start Synchronized Vocal Recording Over Backing Track
   const startRecordingOverSong = async () => {
     stopAllAudio();
+    setIsDemoTake(false);
+    setHasVocalMetrics(false);
+    setAnalysisError(null);
+    setLiveAccuracy(0);
+    setLiveStability(0);
+    setAvgCentsDev(0);
+    setVibratoStats({ rateHz: 0, extentCents: 0, label: "Non misurato" });
+    setMinSungNote("—");
+    setMaxSungNote("—");
+    setAiDiagnosis(null);
     try {
       const ctx = getAudioCtx();
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -576,63 +588,62 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
 
     setRawVocalBuffer(vocalBuf);
 
-    // Summarize telemetry
+    // Summarize only actual voiced frames; never substitute demo scores for missing measurements.
     const pts = telemetryPointsRef.current;
-    let acc = 84;
-    let stab = 82;
-    let avgC = -5;
-    let lowLabel = "Do3";
-    let highLabel = "Sol4";
+    setWeakPassages([...weakPassagesRef.current]);
 
     if (pts.length > 3) {
       const onTargetCount = pts.filter((p) => p.isOnTarget).length;
-      acc = Math.round((onTargetCount / pts.length) * 100);
-      const centsArr = pts.map((p) => p.centsOff || 0);
-      avgC = Math.round(
-        centsArr.reduce((a, b) => a + b, 0) / centsArr.length
-      );
-      const meanAbs =
-        centsArr.reduce((a, b) => a + Math.abs(b), 0) / centsArr.length;
-      stab = Math.max(45, Math.min(98, Math.round(100 - meanAbs * 1.1)));
-
+      const acc = Math.round((onTargetCount / pts.length) * 100);
+      const centsArr = pts.map((p) => p.centsOff ?? 0);
+      const avgC = Math.round(centsArr.reduce((a, b) => a + b, 0) / centsArr.length);
+      const meanAbs = centsArr.reduce((a, b) => a + Math.abs(b), 0) / centsArr.length;
+      const stab = Math.max(45, Math.min(98, Math.round(100 - meanAbs * 1.1)));
       const midis = pts
         .map((p) => p.nearestMidi)
         .filter((m): m is number => m !== null);
-      if (midis.length > 0) {
-        lowLabel = formatMidiNote(Math.min(...midis)).fullLabel;
-        highLabel = formatMidiNote(Math.max(...midis)).fullLabel;
-      }
+      const lowLabel = midis.length > 0 ? formatMidiNote(Math.min(...midis)).fullLabel : "—";
+      const highLabel = midis.length > 0 ? formatMidiNote(Math.max(...midis)).fullLabel : "—";
+      const vib = analyzeVibratoFromPoints(pts);
+
+      setLiveAccuracy(acc);
+      setLiveStability(stab);
+      setAvgCentsDev(avgC);
+      setVibratoStats({ rateHz: vib.rateHz, extentCents: vib.extentCents, label: vib.statusLabel });
+      setMinSungNote(lowLabel);
+      setMaxSungNote(highLabel);
+      setHasVocalMetrics(true);
+      setAnalysisError(null);
+
+      // Trigger AI diagnosis only when there are enough measured voiced frames.
+      await runAiSongDiagnosis(
+        acc,
+        stab,
+        avgC,
+        { rateHz: vib.rateHz, extentCents: vib.extentCents },
+        weakPassagesRef.current,
+        lowLabel,
+        highLabel
+      );
+    } else {
+      setHasVocalMetrics(false);
+      setLiveAccuracy(0);
+      setLiveStability(0);
+      setAvgCentsDev(0);
+      setVibratoStats({ rateHz: 0, extentCents: 0, label: "Non misurato" });
+      setMinSungNote("—");
+      setMaxSungNote("—");
+      setAiDiagnosis(null);
+      setAnalysisError("Registrazione acquisita, ma non ho rilevato abbastanza note vocali per una valutazione affidabile. Prova con cuffie e microfono più vicino.");
     }
-
-    const vib = analyzeVibratoFromPoints(pts);
-    setLiveAccuracy(acc);
-    setLiveStability(stab);
-    setAvgCentsDev(avgC);
-    setVibratoStats(vib);
-    setMinSungNote(lowLabel);
-    setMaxSungNote(highLabel);
-    setWeakPassages([...weakPassagesRef.current]);
-
-    // Trigger AI Vocal Coach Diagnosis and AI Audio Mastering
-    await runAiSongDiagnosis(
-      acc,
-      stab,
-      avgC,
-      vib,
-      weakPassagesRef.current,
-      lowLabel,
-      highLabel
-    );
 
     setIsProcessingAudioAi(true);
     try {
       const mastered = await processVocalBufferWithAiMastering(vocalBuf, {
-        pitchCorrectionAmount: 78,
-        formantSquilloBoostDb: 3.5,
-        warmthLowMidDb: 1.8,
-        compressionRatio: 3.2,
-        reverbWetMix: 0.18,
-        averageCentsError: avgC,
+        pitchCorrectionPercent: pitchCorrectionAmount,
+        eqPresenceDb: squilloBoostDb,
+        compressionRatio,
+        reverbWetPercent,
       });
       setCorrectedVocalBuffer(mastered);
       setUseAiCorrectedVocal(true);
@@ -690,6 +701,9 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
 
     setRawVocalBuffer(testBuf);
 
+    setIsDemoTake(true);
+    setHasVocalMetrics(true);
+    setAnalysisError(null);
     const demoWeak: WeakPassageRecord[] = [
       {
         timeSec: 6.4,
@@ -713,7 +727,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     setVibratoStats({
       rateHz: 5.6,
       extentCents: 36,
-      label: "Vibrato Lirico/Pop Regolare",
+      label: "Demo sintetica · vibrato simulato",
     });
 
     await runAiSongDiagnosis(
@@ -729,12 +743,10 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     setIsProcessingAudioAi(true);
     try {
       const mastered = await processVocalBufferWithAiMastering(testBuf, {
-        pitchCorrectionAmount: 82,
-        formantSquilloBoostDb: 3.5,
-        warmthLowMidDb: 1.8,
+        pitchCorrectionPercent: 82,
+        eqPresenceDb: 3.5,
         compressionRatio: 3.2,
-        reverbWetMix: 0.18,
-        averageCentsError: -9,
+        reverbWetPercent: 18,
       });
       setCorrectedVocalBuffer(mastered);
       setUseAiCorrectedVocal(true);
@@ -749,12 +761,10 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     setIsProcessingAudioAi(true);
     try {
       const mastered = await processVocalBufferWithAiMastering(rawVocalBuffer, {
-        pitchCorrectionAmount,
-        formantSquilloBoostDb: squilloBoostDb,
-        warmthLowMidDb: 1.8,
+        pitchCorrectionPercent: pitchCorrectionAmount,
+        eqPresenceDb: squilloBoostDb,
         compressionRatio,
-        reverbWetMix: reverbWetPercent / 100,
-        averageCentsError: avgCentsDev,
+        reverbWetPercent,
       });
       setCorrectedVocalBuffer(mastered);
       setUseAiCorrectedVocal(true);
@@ -1322,6 +1332,16 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
       </div>
 
       {/* BOTTOM WORKBENCH: AI Vocal Coach Report — Punti di Forza & Punti Deboli su cui Allenarsi */}
+      {analysisError && (
+        <div role="alert" className="rounded-lg border border-amber-500/40 bg-amber-950/30 p-3 text-sm text-amber-200">
+          {analysisError}
+        </div>
+      )}
+      {isDemoTake && (
+        <div className="rounded-lg border border-sky-500/40 bg-sky-950/30 p-3 text-sm text-sky-200">
+          Take dimostrativa sintetica: i punteggi e il vibrato sono illustrativi e non rappresentano misurazioni di una voce reale.
+        </div>
+      )}
       <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-6 flex flex-col gap-5">
         <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4">
           <div>
@@ -1336,22 +1356,22 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
           <div className="flex flex-wrap items-center gap-3 font-mono tabular-nums text-xs">
             <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800">
               Intonazione:{" "}
-              <strong className="text-emerald-400">{liveAccuracy}%</strong>
+              <strong className="text-emerald-400">{hasVocalMetrics ? `${liveAccuracy}%` : "—"}</strong>
             </div>
             <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800">
               Stabilità:{" "}
-              <strong className="text-sky-400">{liveStability}%</strong>
+              <strong className="text-sky-400">{hasVocalMetrics ? `${liveStability}%` : "—"}</strong>
             </div>
             <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800">
               Vibrato:{" "}
               <strong className="text-amber-300">
-                {vibratoStats.rateHz} Hz (±{vibratoStats.extentCents} cent)
+                {hasVocalMetrics ? `${vibratoStats.rateHz} Hz (±${vibratoStats.extentCents} cent)` : "Non misurato"}
               </strong>
             </div>
             <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800">
               Range Brano:{" "}
               <strong className="text-slate-200">
-                {minSungNote} – {maxSungNote}
+                {hasVocalMetrics ? `${minSungNote} – ${maxSungNote}` : "—"}
               </strong>
             </div>
           </div>
