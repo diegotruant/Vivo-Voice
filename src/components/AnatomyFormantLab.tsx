@@ -1140,6 +1140,11 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
           {/* AI Consultation Answer Card */}
           {consultation && (
             <div className="bg-slate-950 border border-sky-500/40 rounded-xl p-4 flex flex-col gap-3.5">
+            {consultation.isFallback && (
+              <div role="status" className="mb-3 rounded-lg border border-amber-500/40 bg-amber-950/30 p-3 text-xs text-amber-200">
+                Risposta generica di riserva: il servizio AI non era disponibile. Le indicazioni non sono state generate sulla base di una nuova valutazione personalizzata.
+              </div>
+            )}
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
                 <h3 className="text-sm font-semibold text-sky-300">
                   {consultation.titoloRisposta}
