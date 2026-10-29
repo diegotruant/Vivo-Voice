@@ -15,21 +15,18 @@ import {
   TrendingUp,
   Target,
   Award,
-  PlusCircle,
   RotateCcw,
 } from "lucide-react";
 import { VocalSessionRecord } from "../types/vocal";
 
 interface VocalProgressSectionProps {
   sessions: VocalSessionRecord[];
-  onAddSimulatedSession: () => void;
   onResetHistory: () => void;
   onNavigateToStudio: () => void;
 }
 
 export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
   sessions,
-  onAddSimulatedSession,
   onResetHistory,
   onNavigateToStudio,
 }) => {
@@ -217,14 +214,6 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
             </div>
 
             <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={onAddSimulatedSession}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-sky-300 transition-colors whitespace-nowrap shrink-0"
-              >
-                <PlusCircle className="w-3.5 h-3.5" />
-                <span>Registra Sessione Test</span>
-              </button>
               <button
                 type="button"
                 onClick={onResetHistory}
