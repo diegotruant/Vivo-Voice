@@ -80,7 +80,9 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
   const [liveCents, setLiveCents] = useState<number | null>(null);
   const [liveRms, setLiveRms] = useState<number>(0);
   const [sessionAccuracy, setSessionAccuracy] = useState<number>(0);
-  const [sessionStability, setSessionStability] = useState<number>(88);
+  const [sessionStability, setSessionStability] = useState<number>(0);
+  const [hasMeasuredData, setHasMeasuredData] = useState<boolean>(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [avgCentsSession, setAvgCentsSession] = useState<number>(0);
   const [vibratoInfo, setVibratoInfo] = useState<{
     rateHz: number;
@@ -90,7 +92,7 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
   }>({
     rateHz: 5.5,
     extentCents: 28,
-    statusLabel: "● VIBRATO NATURALE",
+    statusLabel: "○ NON ANCORA MISURATO",
     isNominal: true,
   });
 
@@ -222,8 +224,14 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
   const requestAiAnalysis = useCallback(
     async (recordedBlob?: Blob) => {
       setIsAnalyzing(true);
+      setAnalysisError(null);
       try {
         const points = telemetryRef.current.filter((p) => p.detectedMidiFloat !== null);
+        if (points.length === 0) {
+          setAnalysisError("Non sono state rilevate note vocali sufficienti. Controlla il microfono e riprova.");
+          return;
+        }
+
         let acc = sessionAccuracy;
         let avgCents = avgCentsSession;
         let stab = sessionStability;
@@ -246,11 +254,6 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
           setSessionAccuracy(acc);
           setAvgCentsSession(avgCents);
           setSessionStability(stab);
-        } else {
-          // If user clicks analyze before singing a full session, use realistic baseline metrics
-          acc = acc || 84;
-          avgCents = avgCents || -4;
-          stab = stab || 86;
         }
 
         // Identify critical notes where centsOff exceeded tolerance
@@ -316,6 +319,7 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
         }
       } catch (err) {
         console.error("Failed to analyze vocal session:", err);
+        setAnalysisError("Analisi non riuscita. Verifica la connessione e riprova.");
       } finally {
         setIsAnalyzing(false);
       }
@@ -354,6 +358,12 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
 
     telemetryRef.current = [];
     setAiResult(null);
+    setAnalysisError(null);
+    setHasMeasuredData(false);
+    setSessionAccuracy(0);
+    setSessionStability(0);
+    setAvgCentsSession(0);
+    setVibratoInfo({ rateHz: 0, extentCents: 0, statusLabel: "○ NON ANCORA MISURATO", isNominal: false });
     lastStepPlayedRef.current = -1;
     startTimeMsRef.current = performance.now();
     setElapsedBeats(0);
@@ -388,7 +398,11 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
     setCurrentStepIndex(0);
     telemetryRef.current = [];
     setSessionAccuracy(0);
+    setSessionStability(0);
     setAvgCentsSession(0);
+    setHasMeasuredData(false);
+    setAnalysisError(null);
+    setVibratoInfo({ rateHz: 0, extentCents: 0, statusLabel: "○ NON ANCORA MISURATO", isNominal: false });
     setAiResult(null);
   };
 
@@ -531,6 +545,8 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
           if (validPts.length > 0) {
             const hits = validPts.filter((p) => p.isOnTarget).length;
             setSessionAccuracy(Math.round((hits / validPts.length) * 100));
+            setHasMeasuredData(true);
+            setVibratoInfo(analyzeVibratoFromPoints(telemetryRef.current));
             const avgC =
               validPts.reduce((s, p) => s + (p.centsOff || 0), 0) /
               validPts.length;
@@ -866,8 +882,11 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             <div className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-3">
               <div className="text-xs text-slate-400">Analisi Vibrato</div>
               <div className="mt-1 text-lg font-semibold text-sky-300 font-mono tabular-nums">
-                {vibratoInfo.rateHz > 0 ? `${vibratoInfo.rateHz} Hz` : "Dritta"} · ±
-                {vibratoInfo.extentCents}c
+                {vibratoInfo.statusLabel.includes("NON ANCORA")
+                  ? "Non misurato"
+                  : vibratoInfo.rateHz > 0
+                  ? `${vibratoInfo.rateHz} Hz · ±${vibratoInfo.extentCents}c`
+                  : `Voce dritta · ±${vibratoInfo.extentCents}c`}
               </div>
               <div className="text-[10px] text-emerald-400 mt-0.5 font-mono font-semibold">
                 {vibratoInfo.statusLabel}
@@ -877,10 +896,10 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             <div className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-3">
               <div className="text-xs text-slate-400">Accuratezza Sessione</div>
               <div className="mt-1 text-lg font-semibold text-emerald-400 font-mono tabular-nums">
-                {sessionAccuracy}%
+                {hasMeasuredData ? `${sessionAccuracy}%` : "—"}
               </div>
               <div className="text-[11px] text-slate-400 mt-0.5 font-mono tabular-nums">
-                Media: {avgCentsSession > 0 ? `+${avgCentsSession}` : avgCentsSession} cent
+                Media: {hasMeasuredData ? `${avgCentsSession > 0 ? `+${avgCentsSession}` : avgCentsSession} cent` : "—"}
               </div>
             </div>
           </div>
@@ -1061,6 +1080,12 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             </div>
           </div>
         </div>
+
+        {analysisError && (
+          <div role="alert" className="rounded-lg border border-amber-500/40 bg-amber-950/30 p-3 text-sm text-amber-200">
+            {analysisError}
+          </div>
+        )}
 
         {/* AI Vocal Coach Feedback Card (Appears immediately when analysis completes) */}
         {aiResult && (
