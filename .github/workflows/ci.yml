@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "codex/**", "feature/**", "fix/**"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Typecheck and production build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies from lockfile
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run lint
+
+      - name: Build
+        run: bun run build
