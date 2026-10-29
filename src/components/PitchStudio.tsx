@@ -882,8 +882,8 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             <div className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-3">
               <div className="text-xs text-slate-400">Analisi Vibrato</div>
               <div className="mt-1 text-lg font-semibold text-sky-300 font-mono tabular-nums">
-                {vibratoInfo.statusLabel.includes("NON ANCORA")
-                  ? "Non misurato"
+                {vibratoInfo.rateHz === 0 && vibratoInfo.extentCents === 0 && !vibratoInfo.isNominal
+                  ? "In attesa di dati sufficienti"
                   : vibratoInfo.rateHz > 0
                   ? `${vibratoInfo.rateHz} Hz · ±${vibratoInfo.extentCents}c`
                   : `Voce dritta · ±${vibratoInfo.extentCents}c`}
