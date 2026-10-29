@@ -104,7 +104,7 @@ interface AnatomyFormantLabProps {
   selectedRegisterId: VoiceRegisterId;
   lowNoteLabel: string;
   highNoteLabel: string;
-  recentAccuracy: number;
+  recentAccuracy: number | null;
   lastAnalysis: AiAnalysisResult | null;
   lastExerciseTitle: string;
   onPlayCoachVoice: (text: string) => void;
@@ -1194,7 +1194,7 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
               <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
                 <span>Ultima Valutazione in Palestra ({lastExerciseTitle})</span>
                 <span className="font-mono text-emerald-400 font-semibold">
-                  Accuratezza: {recentAccuracy}%
+                  Accuratezza: {recentAccuracy === null ? "Non ancora disponibile" : `${recentAccuracy}%`}
                 </span>
               </div>
               <p className="text-xs text-slate-200 font-medium">
