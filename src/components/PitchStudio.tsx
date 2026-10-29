@@ -302,14 +302,18 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
 
         const data: AiAnalysisResult = await res.json();
         setAiResult(data);
-        onSaveAnalysis(
-          data,
-          acc,
-          selectedExercise.title,
-          stab,
-          avgCents,
-          selectedExercise.category
-        );
+        // The interactive simulator is useful for UI checks, but its synthetic
+        // signal must never be persisted as a learner's measured progress.
+        if (inputModeRef.current === "mic") {
+          onSaveAnalysis(
+            data,
+            acc,
+            selectedExercise.title,
+            stab,
+            avgCents,
+            selectedExercise.category
+          );
+        }
       } catch (err) {
         console.error("Failed to analyze vocal session:", err);
       } finally {
