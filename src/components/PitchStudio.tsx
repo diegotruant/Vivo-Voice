@@ -1090,6 +1090,11 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
         {/* AI Vocal Coach Feedback Card (Appears immediately when analysis completes) */}
         {aiResult && (
           <div className="bg-slate-900/95 border border-sky-500/40 rounded-xl p-5 flex flex-col gap-4">
+            {aiResult.isFallback && (
+              <div role="status" className="rounded-lg border border-amber-500/40 bg-amber-950/30 p-3 text-xs text-amber-200">
+                Risposta generica di riserva: il servizio AI non era disponibile. Non considerarla una valutazione personalizzata della tua esecuzione.
+              </div>
+            )}
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
               <div>
                 <div className="text-xs text-sky-400 font-medium">
