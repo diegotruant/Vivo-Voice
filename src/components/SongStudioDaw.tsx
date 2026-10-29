@@ -361,6 +361,10 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
     stopAllAudio();
+    setIsDemoTake(false);
+    setHasVocalMetrics(false);
+    setAnalysisError(null);
+    setAiDiagnosis(null);
 
     try {
       const arrayBuf = await file.arrayBuffer();
@@ -704,6 +708,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     setIsDemoTake(true);
     setHasVocalMetrics(true);
     setAnalysisError(null);
+    setAiDiagnosis(null);
     const demoWeak: WeakPassageRecord[] = [
       {
         timeSec: 6.4,
@@ -1365,7 +1370,11 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
             <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800">
               Vibrato:{" "}
               <strong className="text-amber-300">
-                {hasVocalMetrics ? `${vibratoStats.rateHz} Hz (±${vibratoStats.extentCents} cent)` : "Non misurato"}
+                {hasVocalMetrics
+                  ? vibratoStats.rateHz > 0
+                    ? `${vibratoStats.rateHz} Hz (±${vibratoStats.extentCents} cent)`
+                    : vibratoStats.label
+                  : "Non misurato"}
               </strong>
             </div>
             <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800">
