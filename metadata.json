@@ -1,0 +1,6 @@
+{
+  "name": "VoceViva — Vocal Coach & Accademia di Canto",
+  "description": "Studio vocale interattivo con rilevamento dell'intonazione in tempo reale, esercizi guidati al pianoforte, trainer di respirazione diaframmatica e coaching vocale AI.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
