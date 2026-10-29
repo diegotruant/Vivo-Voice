@@ -91,6 +91,8 @@ Repository: `diegotruant/Vivo-Voice` — default branch `main`. This plan is bei
 
 ## Research and reference projects
 
+See [docs/RESEARCH_MATRIX.md](RESEARCH_MATRIX.md) for the capability-by-capability study matrix, integration guardrails and pitch-engine evaluation criteria.
+
 These are study references, not dependencies to copy blindly. Check each project's current license and model/data terms before adopting code or weights.
 
 - OpenVox Studio: https://github.com/VadymYem/OpenVox — broad open-source browser studio, local-first audio workflow, AudioWorklet and WebAssembly-oriented architecture.
