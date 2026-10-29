@@ -89,4 +89,4 @@ At the moment, `lint` runs the TypeScript compiler in no-emit mode. Automated DS
 
 Work on a feature branch, make small changes, run quality checks, and review the diff before merging. For audio/DSP changes, include synthetic-signal tests and representative real-singing evaluation rather than relying on visual inspection of the interface.
 
-See [docs/ENGINEERING_PLAN.md](docs/ENGINEERING_PLAN.md) for the current implementation roadmap.
+See [docs/ENGINEERING_PLAN.md](docs/ENGINEERING_PLAN.md) for the current implementation roadmap and [docs/RESEARCH_MATRIX.md](docs/RESEARCH_MATRIX.md) for the research and capability matrix.
