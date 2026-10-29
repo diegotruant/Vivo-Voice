@@ -23,10 +23,7 @@ import {
   AiAnalysisResult,
   VocalSessionRecord,
 } from "./types/vocal";
-import {
-  VOICE_REGISTERS,
-  VOCAL_EXERCISES,
-} from "./utils/audioEngine";
+import { VOICE_REGISTERS } from "./utils/audioEngine";
 
 type StudioTab =
   | "diaframma"
@@ -38,93 +35,6 @@ type StudioTab =
   | "risonanza"
   | "progressi";
 
-const INITIAL_PROGRESS_SESSIONS: VocalSessionRecord[] = [
-  {
-    id: "sess-1",
-    dateLabel: "14 Ott",
-    fullDate: "2026-10-14",
-    exerciseTitle: "Sostenuto & Appoggio Diaframmatico",
-    category: "Stabilità & Fiato",
-    registerName: "Tenore",
-    accuracyPercent: 68,
-    stabilityPercent: 71,
-    avgCentsDeviation: -14,
-    durationMin: 12,
-    coachNote:
-      "Tendenza lievemente calante nei finali di frase; iniziare ad espandere le costole inferiori.",
-  },
-  {
-    id: "sess-2",
-    dateLabel: "17 Ott",
-    fullDate: "2026-10-17",
-    exerciseTitle: "Solfeggio Cantato per Gradi Congiunti",
-    category: "Solfeggio & Orecchio",
-    registerName: "Tenore",
-    accuracyPercent: 75,
-    stabilityPercent: 78,
-    avgCentsDeviation: -8,
-    durationMin: 15,
-    coachNote:
-      "Buona lettura sul pentagramma e presa di fiato sul quarto movimento in levare.",
-  },
-  {
-    id: "sess-3",
-    dateLabel: "20 Ott",
-    fullDate: "2026-10-20",
-    exerciseTitle: "Scala di Quinta Legato (1-2-3-4-5-4-3-2-1)",
-    category: "Legato & Omogeneità",
-    registerName: "Tenore",
-    accuracyPercent: 79,
-    stabilityPercent: 82,
-    avgCentsDeviation: -6,
-    durationMin: 18,
-    coachNote:
-      "Passaggi per gradi congiunti più fluidi e laringe più stabile sul 5° grado.",
-  },
-  {
-    id: "sess-4",
-    dateLabel: "23 Ott",
-    fullDate: "2026-10-23",
-    exerciseTitle: "Ponte sul Passaggio & Voce Mista (1-5-8-5-1)",
-    category: "Passaggio di Registro",
-    registerName: "Tenore",
-    accuracyPercent: 84,
-    stabilityPercent: 85,
-    avgCentsDeviation: 4,
-    durationMin: 16,
-    coachNote:
-      "Buon alleggerimento della massa vocale sull'ottava con vocale stretta 'U'.",
-  },
-  {
-    id: "sess-5",
-    dateLabel: "26 Ott",
-    fullDate: "2026-10-26",
-    exerciseTitle: "Triade Maggiore in Maschera (1-3-5-3-1)",
-    category: "Intonazione & Risonanza",
-    registerName: "Tenore",
-    accuracyPercent: 88,
-    stabilityPercent: 89,
-    avgCentsDeviation: -3,
-    durationMin: 20,
-    coachNote:
-      "Intonazione ben centrata nel corridoio armonico (±15 cent) e ottimo sostegno.",
-  },
-  {
-    id: "sess-6",
-    dateLabel: "Oggi",
-    fullDate: "2026-10-28",
-    exerciseTitle: "Agilità Belcantistica & Fioritura",
-    category: "Agilità & Controllo",
-    registerName: "Tenore",
-    accuracyPercent: 91,
-    stabilityPercent: 90,
-    avgCentsDeviation: -2,
-    durationMin: 18,
-    coachNote:
-      "Ottima precisione glottica nei gradi rapidi mantenendo il torace nobile e aperto.",
-  },
-];
-
 const STORAGE_KEY = "voceviva_progress_sessions_v1";
 
 export default function App() {
@@ -133,7 +43,7 @@ export default function App() {
     useState<VoiceRegisterId>("tenore");
   const [lowNoteLabel, setLowNoteLabel] = useState<string>("Do3");
   const [highNoteLabel, setHighNoteLabel] = useState<string>("Do5");
-  const [recentAccuracy, setRecentAccuracy] = useState<number>(91);
+  const [recentAccuracy, setRecentAccuracy] = useState<number | null>(null);
   const [lastAnalysis, setLastAnalysis] = useState<AiAnalysisResult | null>(
     null
   );
@@ -147,12 +57,25 @@ export default function App() {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed)) {
+          // Remove known prototype fixtures and previously generated demo sessions.
+          const realSessions = parsed.filter((session) => {
+            if (!session || typeof session !== "object") return false;
+            const id = String((session as VocalSessionRecord).id ?? "");
+            const note = String((session as VocalSessionRecord).coachNote ?? "");
+            return !/^sess-[1-6]$/.test(id) &&
+              !note.startsWith("Esecuzione registrata: progressione costante della tenuta diaframmatica");
+          });
+          if (realSessions.length !== parsed.length) {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(realSessions));
+          }
+          return realSessions;
+        }
       }
     } catch {
       // ignore storage error
     }
-    return INITIAL_PROGRESS_SESSIONS;
+    return [];
   });
 
   useEffect(() => {
@@ -207,49 +130,8 @@ export default function App() {
     [currentRegister.name]
   );
 
-  const handleAddSimulatedSession = useCallback(() => {
-    const randomEx =
-      VOCAL_EXERCISES[Math.floor(Math.random() * VOCAL_EXERCISES.length)];
-    const lastAcc =
-      sessions.length > 0
-        ? sessions[sessions.length - 1].accuracyPercent
-        : 82;
-    const nextAcc = Math.max(
-      72,
-      Math.min(98, lastAcc + Math.floor(Math.random() * 6) - 1)
-    );
-    const nextStab = Math.max(
-      75,
-      Math.min(97, nextAcc + Math.floor(Math.random() * 5) - 2)
-    );
-    const nextCents = Math.floor(Math.random() * 9) - 4;
-    const now = new Date();
-    const timeLabel = now.toLocaleTimeString("it-IT", {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-
-    const newSession: VocalSessionRecord = {
-      id: `sess-${Date.now()}`,
-      dateLabel: `Sessione ${timeLabel}`,
-      fullDate: now.toISOString().slice(0, 10),
-      exerciseTitle: randomEx.title,
-      category: randomEx.category,
-      registerName: currentRegister.name,
-      accuracyPercent: nextAcc,
-      stabilityPercent: nextStab,
-      avgCentsDeviation: nextCents,
-      durationMin: 12,
-      coachNote:
-        "Esecuzione registrata: progressione costante della tenuta diaframmatica e centratura tonale.",
-    };
-
-    setSessions((prev) => [...prev, newSession]);
-    setRecentAccuracy(nextAcc);
-  }, [sessions, currentRegister.name]);
-
   const handleResetHistory = useCallback(() => {
-    setSessions(INITIAL_PROGRESS_SESSIONS);
+    setSessions([]);
   }, []);
 
   const handleApplyRegisterFromFinder = useCallback(
@@ -532,7 +414,7 @@ export default function App() {
                     : "text-slate-400 hover:text-slate-100"
                 }`}
               >
-                08. Progressi ({recentAccuracy}%)
+                08. Progressi
               </button>
             </div>
           </div>
@@ -606,7 +488,6 @@ export default function App() {
           {activeTab === "progressi" && (
             <VocalProgressSection
               sessions={sessions}
-              onAddSimulatedSession={handleAddSimulatedSession}
               onResetHistory={handleResetHistory}
               onNavigateToStudio={() => setActiveTab("palestra")}
             />
@@ -623,15 +504,19 @@ export default function App() {
                 Andamento Accuratezza Vocale ({sessions.length} sessioni registrate)
               </div>
               <p className="text-[11px] text-slate-400 mt-0.5">
-                Evoluzione da{" "}
-                <span className="font-mono text-slate-200">
-                  {sessions[0]?.accuracyPercent ?? 68}%
-                </span>{" "}
-                a{" "}
-                <span className="font-mono text-emerald-400 font-semibold">
-                  {sessions[sessions.length - 1]?.accuracyPercent ?? recentAccuracy}%
-                </span>
-                . Apri la vista completa per analizzare stabilità e deviazione in centesimi.
+                {sessions.length > 0 ? (
+                  <>
+                    Evoluzione da{" "}
+                    <span className="font-mono text-slate-200">{sessions[0].accuracyPercent}%</span>{" "}
+                    a{" "}
+                    <span className="font-mono text-emerald-400 font-semibold">
+                      {sessions[sessions.length - 1].accuracyPercent}%
+                    </span>
+                    . Apri la vista completa per analizzare stabilità e deviazione in centesimi.
+                  </>
+                ) : (
+                  "Completa un esercizio e salva l'analisi per visualizzare qui i tuoi progressi reali."
+                )}
               </p>
             </div>
 

@@ -15,21 +15,18 @@ import {
   TrendingUp,
   Target,
   Award,
-  PlusCircle,
   RotateCcw,
 } from "lucide-react";
 import { VocalSessionRecord } from "../types/vocal";
 
 interface VocalProgressSectionProps {
   sessions: VocalSessionRecord[];
-  onAddSimulatedSession: () => void;
   onResetHistory: () => void;
   onNavigateToStudio: () => void;
 }
 
 export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
   sessions,
-  onAddSimulatedSession,
   onResetHistory,
   onNavigateToStudio,
 }) => {
@@ -48,6 +45,8 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
   }, [sessions, selectedCategory]);
 
   // Compute aggregate KPIs with tabular precision
+  const hasSessions = filteredSessions.length > 0;
+
   const stats = useMemo(() => {
     if (filteredSessions.length === 0) {
       return {
@@ -91,35 +90,37 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
           <div className="text-xs text-slate-400">Accuratezza Ultima Sessione</div>
           <div className="mt-1.5 flex items-baseline justify-between font-mono tabular-nums">
             <span className="text-2xl font-bold text-slate-100">
-              {stats.latestAccuracy}%
+              {hasSessions ? `${stats.latestAccuracy}%` : "—"}
             </span>
             <span
               className={`text-xs font-semibold ${
                 stats.improvementDelta >= 0 ? "text-emerald-400" : "text-amber-400"
               }`}
             >
-              {stats.improvementDelta >= 0
-                ? `▲ +${stats.improvementDelta}% vs Inizio`
-                : `▼ ${stats.improvementDelta}% vs Inizio`}
+              {hasSessions
+                ? stats.improvementDelta >= 0
+                  ? `▲ +${stats.improvementDelta}% vs Inizio`
+                  : `▼ ${stats.improvementDelta}% vs Inizio`
+                : "Nessun dato"}
             </span>
           </div>
           <div className="text-xs text-slate-400 mt-1">
-            Media periodo: <span className="font-mono text-slate-200">{stats.avgAccuracy}%</span>
+            Media periodo: <span className="font-mono text-slate-200">{hasSessions ? `${stats.avgAccuracy}%` : "—"}</span>
           </div>
         </div>
 
         <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-5">
-          <div className="text-xs text-slate-400">Stabilità Sostenuto & Fiato</div>
+          <div className="text-xs text-slate-400">Stabilità dell'intonazione</div>
           <div className="mt-1.5 flex items-baseline justify-between font-mono tabular-nums">
             <span className="text-2xl font-bold text-sky-400">
-              {stats.avgStability}%
+              {hasSessions ? `${stats.avgStability}%` : "—"}
             </span>
             <span className="text-xs text-sky-300 font-semibold">
-              ● APPOGGIO COSTANTE
+              {hasSessions ? "Indicatore acustico" : "In attesa di dati"}
             </span>
           </div>
           <div className="text-xs text-slate-400 mt-1">
-            Tenuta media su note lunghe e passaggi
+            Stima dalla stabilità tonale; non misura direttamente il sostegno respiratorio.
           </div>
         </div>
 
@@ -127,14 +128,18 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
           <div className="text-xs text-slate-400">Scarto Medio Intonazione</div>
           <div className="mt-1.5 flex items-baseline justify-between font-mono tabular-nums">
             <span className="text-2xl font-bold text-emerald-400">
-              ±{stats.avgAbsCents} cent
+              {hasSessions ? `±${stats.avgAbsCents} cent` : "—"}
             </span>
             <span className="text-xs text-emerald-300 font-semibold">
-              {stats.avgAbsCents <= 12 ? "● CENTRO ARMONICO" : "▲ IN CALIBRAZIONE"}
+              {hasSessions
+                ? stats.avgAbsCents <= 12
+                  ? "Scarto contenuto"
+                  : "Da migliorare"
+                : "In attesa di dati"}
             </span>
           </div>
           <div className="text-xs text-slate-400 mt-1">
-            Soglia conservatoriale ottimale: ≤15 cent
+            Indicatore descrittivo: l'interpretazione dipende dalla qualità dell'audio e dal rilevatore.
           </div>
         </div>
 
@@ -219,14 +224,6 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={onAddSimulatedSession}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-sky-300 transition-colors whitespace-nowrap shrink-0"
-              >
-                <PlusCircle className="w-3.5 h-3.5" />
-                <span>Registra Sessione Test</span>
-              </button>
-              <button
-                type="button"
                 onClick={onResetHistory}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-950 hover:bg-slate-800 text-slate-400 border border-slate-800 transition-colors whitespace-nowrap shrink-0"
               >
@@ -238,7 +235,14 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
 
           {/* Primary Recharts Visualization Container */}
           <div className="w-full h-[320px] bg-[#0B1120] border border-slate-800 rounded-xl p-4">
-            {chartMetric === "accuracy" ? (
+            {filteredSessions.length === 0 ? (
+              <div className="flex h-full flex-col items-center justify-center gap-2 text-center px-6">
+                <p className="text-sm font-semibold text-slate-200">Nessuna sessione misurata</p>
+                <p className="max-w-md text-xs leading-relaxed text-slate-400">
+                  Completa un esercizio nella Palestra Vocale e salva l'analisi per iniziare a vedere i tuoi progressi. Non mostriamo punteggi dimostrativi come risultati reali.
+                </p>
+              </div>
+            ) : chartMetric === "accuracy" ? (
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
                   data={filteredSessions}
@@ -301,7 +305,7 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
                     stroke="#10B981"
                     strokeDasharray="4 4"
                     label={{
-                      value: "Target Accademia 85%",
+                      value: "Riferimento visivo 85%",
                       position: "insideTopRight",
                       fill: "#10B981",
                       fontSize: 10,
