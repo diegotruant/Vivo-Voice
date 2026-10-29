@@ -43,7 +43,7 @@ export default function App() {
     useState<VoiceRegisterId>("tenore");
   const [lowNoteLabel, setLowNoteLabel] = useState<string>("Do3");
   const [highNoteLabel, setHighNoteLabel] = useState<string>("Do5");
-  const [recentAccuracy, setRecentAccuracy] = useState<number>(91);
+  const [recentAccuracy, setRecentAccuracy] = useState<number | null>(null);
   const [lastAnalysis, setLastAnalysis] = useState<AiAnalysisResult | null>(
     null
   );
@@ -414,7 +414,7 @@ export default function App() {
                     : "text-slate-400 hover:text-slate-100"
                 }`}
               >
-                08. Progressi ({recentAccuracy}%)
+                08. Progressi
               </button>
             </div>
           </div>
@@ -504,15 +504,19 @@ export default function App() {
                 Andamento Accuratezza Vocale ({sessions.length} sessioni registrate)
               </div>
               <p className="text-[11px] text-slate-400 mt-0.5">
-                Evoluzione da{" "}
-                <span className="font-mono text-slate-200">
-                  {sessions[0]?.accuracyPercent ?? 68}%
-                </span>{" "}
-                a{" "}
-                <span className="font-mono text-emerald-400 font-semibold">
-                  {sessions[sessions.length - 1]?.accuracyPercent ?? recentAccuracy}%
-                </span>
-                . Apri la vista completa per analizzare stabilità e deviazione in centesimi.
+                {sessions.length > 0 ? (
+                  <>
+                    Evoluzione da{" "}
+                    <span className="font-mono text-slate-200">{sessions[0].accuracyPercent}%</span>{" "}
+                    a{" "}
+                    <span className="font-mono text-emerald-400 font-semibold">
+                      {sessions[sessions.length - 1].accuracyPercent}%
+                    </span>
+                    . Apri la vista completa per analizzare stabilità e deviazione in centesimi.
+                  </>
+                ) : (
+                  "Completa un esercizio e salva l'analisi per visualizzare qui i tuoi progressi reali."
+                )}
               </p>
             </div>
 
