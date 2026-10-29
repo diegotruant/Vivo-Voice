@@ -1420,6 +1420,11 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
 
         {aiDiagnosis && (
           <div className="flex flex-col gap-5">
+            {aiDiagnosis.isFallback && (
+              <div role="status" className="rounded-lg border border-amber-500/40 bg-amber-950/30 p-3 text-xs text-amber-200">
+                Risposta generica di riserva: il servizio AI non era disponibile. Verifica i risultati con un insegnante e riprova quando il servizio è disponibile.
+              </div>
+            )}
             {/* Summary Banner + Voice Playback */}
             <div className="bg-slate-950 border border-sky-500/30 rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
               <div className="flex flex-col gap-1">
