@@ -59,5 +59,10 @@ l'ambito accademico (es. VoiceWorm, Università di Bologna).
   intonazione normalizzato (errore ≤0,2 cent da 65 a 1046 Hz su toni sintetici); vocal fry misurato nel riscaldamento;
   sintetizzatore formanti e "stop" corretti; Palestra aggiornata a ~15 Hz invece di 60; voce del coach senza
   interruzioni; avvio di produzione, porta configurabile, limite richieste AI per IP, errori JSON, header di sicurezza.
-- Ancora aperti: soglia di volume del riscaldamento non calibrata per dispositivo; limite richieste solo in memoria
-  (non condiviso tra più istanze); correzione d'intonazione AI ancora semplice (granulare, semitono più vicino).
+- **Punti aperti della fase 2: chiusi.** Calibrazione del microfono per dispositivo nel riscaldamento (soglia in dB
+  rispetto al volume comodo); limiti di richieste condivisibili tra più istanze via Redis (`REDIS_URL`) e tetto
+  giornaliero per la chiave del server (`SERVER_KEY_DAILY_LIMIT`); correzione d'intonazione musicale nello Studio Brani
+  (tonalità stimata dalla voce o scelta dall'utente, vibrato preservato, TD-PSOLA, stereo; errore mediano da 33,5 a
+  1,5 cent sul test sintetico). In sviluppo l'HMR di Vite usa lo stesso server HTTP (niente porta fissa 24678).
+- Limiti noti: la correzione d'intonazione gira sul thread principale (~5 s per un take di 3 minuti, interfaccia ferma
+  nel frattempo); in tonalità minore usa la scala minore naturale (per la sensibile alzata scegliere "Cromatica").

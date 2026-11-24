@@ -27,6 +27,11 @@ import {
   encodeAudioBufferToWav,
   createStudioBackingStemBuffer,
   VOICE_REGISTERS,
+  NOTE_NAMES_IT,
+  formatMusicalKey,
+  KeySelection,
+  KeyEstimate,
+  MusicalKey,
 } from "../utils/audioEngine";
 import {
   VoiceRegisterId,
@@ -49,6 +54,16 @@ interface WeakPassageRecord {
   noteLabel: string;
   centsOff: number;
   issue: string;
+}
+
+function keySelectionToValue(k: KeySelection): string {
+  return typeof k === "string" ? k : `${k.tonic}-${k.mode}`;
+}
+
+function valueToKeySelection(v: string): KeySelection {
+  if (v === "auto" || v === "chromatic") return v;
+  const [tonic, mode] = v.split("-");
+  return { tonic: Number(tonic), mode: mode === "minor" ? "minor" : "major" };
 }
 
 export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
@@ -124,6 +139,13 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
   const [squilloBoostDb, setSquilloBoostDb] = useState<number>(3.5);
   const [compressionRatio, setCompressionRatio] = useState<number>(3.2);
   const [reverbWetPercent, setReverbWetPercent] = useState<number>(18);
+  // Target scale for pitch correction ("auto" = estimated from the take)
+  const [keySelection, setKeySelection] = useState<KeySelection>("auto");
+  const keySelectionRef = useRef<KeySelection>("auto");
+  const [pitchKeyInfo, setPitchKeyInfo] = useState<{
+    estimatedKey: KeyEstimate | null;
+    appliedKey: MusicalKey | "chromatic";
+  } | null>(null);
 
   // Refs for Web Audio & Canvases
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -779,6 +801,8 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
         eqPresenceDb: preset?.eqPresenceDb ?? squilloBoostDb,
         compressionRatio: preset?.compressionRatio ?? compressionRatio,
         reverbWetPercent: preset?.reverbWetPercent ?? reverbWetPercent,
+        key: keySelectionRef.current,
+        onPitchAnalysis: setPitchKeyInfo,
       });
       setCorrectedVocalBuffer(mastered);
       setUseAiCorrectedVocal(true);
@@ -896,6 +920,8 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
         eqPresenceDb: 3.5,
         compressionRatio: 3.2,
         reverbWetPercent: 18,
+        key: keySelectionRef.current,
+        onPitchAnalysis: setPitchKeyInfo,
       });
       setCorrectedVocalBuffer(mastered);
       setUseAiCorrectedVocal(true);
@@ -905,7 +931,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
   };
 
   // Re-run AI Vocal Mastering when user adjusts the correction sliders
-  const handleApplyAiMastering = async () => {
+  const handleApplyAiMastering = async (keyOverride?: KeySelection) => {
     if (!rawVocalBuffer) return;
     setIsProcessingAudioAi(true);
     try {
@@ -914,6 +940,8 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
         eqPresenceDb: squilloBoostDb,
         compressionRatio,
         reverbWetPercent,
+        key: keyOverride ?? keySelectionRef.current,
+        onPitchAnalysis: setPitchKeyInfo,
       });
       setCorrectedVocalBuffer(mastered);
       setUseAiCorrectedVocal(true);
@@ -1412,9 +1440,10 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
           </div>
 
           <p className="text-xs text-slate-300 leading-relaxed">
-            La catena AI riallinea i centesimi calanti/crescenti della tua
-            traccia vocale, esalta la 3° Formante dello Squillo (3 kHz) e
-            applica compressione ottica per fonderla negli stem strumentali.
+            La catena riporta le note calanti/crescenti della tua traccia verso
+            le note della tonalità scelta (preservando il vibrato), esalta la
+            3° Formante dello Squillo (3 kHz) e applica compressione ottica per
+            fonderla negli stem strumentali.
           </p>
 
           {/* Mastering Parameter Sliders */}
@@ -1422,7 +1451,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
             <div className="bg-slate-950 border border-slate-800 rounded-lg p-3">
               <div className="flex justify-between text-xs mb-1">
                 <span className="text-slate-200 font-medium">
-                  1. Correzione Intonazione AI (Pitch Center)
+                  1. Correzione Intonazione (verso la scala)
                 </span>
                 <span className="font-mono text-emerald-400 font-semibold">
                   {pitchCorrectionAmount}%
@@ -1439,6 +1468,63 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
                 }
                 className="w-full h-1.5 bg-slate-800 rounded-lg cursor-pointer"
               />
+              <p className="mt-1 text-[10px] text-slate-500">
+                Più alta = correzione più marcata e più rapida (100% ≈ 20 ms, valori bassi ≈ 200 ms).
+              </p>
+            </div>
+
+            <div className="bg-slate-950 border border-slate-800 rounded-lg p-3">
+              <label
+                htmlFor="key-selection"
+                className="flex justify-between text-xs mb-1.5 text-slate-200 font-medium"
+              >
+                Tonalità per la correzione
+              </label>
+              <select
+                id="key-selection"
+                value={keySelectionToValue(keySelection)}
+                onChange={(e) => {
+                  const next = valueToKeySelection(e.target.value);
+                  setKeySelection(next);
+                  keySelectionRef.current = next;
+                  if (rawVocalBuffer && !isProcessingAudioAi) void handleApplyAiMastering(next);
+                }}
+                className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 focus:border-emerald-500 focus:outline-none"
+              >
+                <option value="auto">
+                  {pitchKeyInfo?.estimatedKey
+                    ? `Auto (stimata: ${formatMusicalKey(pitchKeyInfo.estimatedKey)})`
+                    : "Auto (stimata dalla tua voce)"}
+                </option>
+                <option value="chromatic">Cromatica (semitono più vicino)</option>
+                <optgroup label="Maggiori">
+                  {NOTE_NAMES_IT.map((name, pc) => (
+                    <option key={`M${pc}`} value={`${pc}-major`}>
+                      {name} maggiore
+                    </option>
+                  ))}
+                </optgroup>
+                <optgroup label="Minori">
+                  {NOTE_NAMES_IT.map((name, pc) => (
+                    <option key={`m${pc}`} value={`${pc}-minor`}>
+                      {name} minore
+                    </option>
+                  ))}
+                </optgroup>
+              </select>
+              <p className="mt-1.5 text-[10px] leading-snug text-slate-400">
+                {pitchKeyInfo
+                  ? pitchKeyInfo.estimatedKey
+                    ? `Tonalità stimata dalla tua voce: ${formatMusicalKey(pitchKeyInfo.estimatedKey)} (affidabilità ${Math.round(
+                        Math.max(0, pitchKeyInfo.estimatedKey.confidence) * 100
+                      )}%). `
+                    : "Voce insufficiente per stimare la tonalità. "
+                  : "La tonalità viene stimata dalle note che canti (la base non contiene la melodia). "}
+                {pitchKeyInfo &&
+                  (pitchKeyInfo.appliedKey === "chromatic"
+                    ? "Correzione verso il semitono più vicino."
+                    : `Correzione verso le note di ${formatMusicalKey(pitchKeyInfo.appliedKey)}.`)}
+              </p>
             </div>
 
             <div className="bg-slate-950 border border-slate-800 rounded-lg p-3">
@@ -1504,7 +1590,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
 
           <button
             type="button"
-            onClick={handleApplyAiMastering}
+            onClick={() => void handleApplyAiMastering()}
             disabled={!rawVocalBuffer || isProcessingAudioAi}
             className="flex items-center justify-center gap-2 w-full py-2.5 px-4 rounded-lg text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 transition-colors"
           >

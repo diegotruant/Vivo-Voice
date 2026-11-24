@@ -902,9 +902,364 @@ export function encodeAudioBufferToWav(buffer: AudioBuffer): Blob {
   return new Blob([arrayBuffer], { type: "audio/wav" });
 }
 
+// ---------------------------------------------------------------------------
+// Key-aware vocal pitch correction (pitch tracking + key estimate + TD-PSOLA)
+// ---------------------------------------------------------------------------
+
+export type ScaleMode = "major" | "minor";
+
+export interface MusicalKey {
+  /** Pitch class of the tonic, 0 = Do (C) … 11 = Si (B). */
+  tonic: number;
+  mode: ScaleMode;
+}
+
+/** "auto" = key estimated from the take; "chromatic" = snap to the nearest semitone. */
+export type KeySelection = "auto" | "chromatic" | MusicalKey;
+
+export interface KeyEstimate extends MusicalKey {
+  /** Pearson correlation with the best Krumhansl–Kessler profile (−1…1). */
+  confidence: number;
+}
+
+const SCALE_STEPS: Record<ScaleMode, number[]> = {
+  major: [0, 2, 4, 5, 7, 9, 11],
+  // Natural minor: the raised 7th of harmonic minor is not included, so a flat tonic
+  // is never pulled to the leading tone.
+  minor: [0, 2, 3, 5, 7, 8, 10],
+};
+
+// Krumhansl–Kessler key profiles
+const KK_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const KK_MINOR = [6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+
+/** Italian label, e.g. "La minore". */
+export function formatMusicalKey(key: MusicalKey): string {
+  return `${NOTE_NAMES_IT[((key.tonic % 12) + 12) % 12]} ${key.mode === "major" ? "maggiore" : "minore"}`;
+}
+
+/** Krumhansl–Schmuckler key finding on a 12-bin pitch-class histogram. */
+export function estimateKeyFromPitchClassHistogram(hist: number[]): KeyEstimate | null {
+  const total = hist.reduce((a, b) => a + b, 0);
+  if (!(total > 0)) return null;
+  const corr = (x: number[], y: number[]) => {
+    const mx = x.reduce((a, b) => a + b, 0) / 12;
+    const my = y.reduce((a, b) => a + b, 0) / 12;
+    let num = 0, dx = 0, dy = 0;
+    for (let i = 0; i < 12; i++) {
+      num += (x[i] - mx) * (y[i] - my);
+      dx += (x[i] - mx) ** 2;
+      dy += (y[i] - my) ** 2;
+    }
+    return dx > 0 && dy > 0 ? num / Math.sqrt(dx * dy) : 0;
+  };
+  let best: KeyEstimate | null = null;
+  for (let tonic = 0; tonic < 12; tonic++) {
+    for (const mode of ["major", "minor"] as ScaleMode[]) {
+      const profile = mode === "major" ? KK_MAJOR : KK_MINOR;
+      const rotated = Array.from({ length: 12 }, (_, pc) => profile[(pc - tonic + 12) % 12]);
+      const c = corr(hist, rotated);
+      if (!best || c > best.confidence) best = { tonic, mode, confidence: c };
+    }
+  }
+  return best;
+}
+
+export interface PitchCorrectionOptions {
+  /** 0–100: amount of correction and retune speed (100 = fast ~20 ms, low = slow ~200 ms). */
+  strengthPercent: number;
+  /** Target scale (default "auto"). */
+  key?: KeySelection;
+}
+
+export interface PitchCorrectionResult {
+  /** Corrected channels, same count and length as the input. */
+  channels: Float32Array[];
+  /** Key estimated from the sung take (null if too little voiced material). */
+  estimatedKey: KeyEstimate | null;
+  /** Scale actually used for snapping. */
+  appliedKey: MusicalKey | "chromatic";
+  /** Share of analysis frames detected as voiced (0–1). */
+  voicedRatio: number;
+}
+
+interface PitchTrack {
+  /** Analysis frame centers, in input samples. */
+  centers: Float64Array;
+  /** Detected MIDI pitch per frame (NaN = unvoiced). */
+  midi: Float64Array;
+  /** Vibrato-free center pitch per frame (NaN = unvoiced). */
+  center: Float64Array;
+  hop: number;
+}
+
+const CENTER_WINDOW_SEC = 0.17; // ≈ one vibrato cycle: the moving average cancels 5–6.5 Hz vibrato
+
+/** Tracks the pitch of a mono signal (normalized internally so the detector's noise gate is level-independent). */
+function trackPitch(mono: Float32Array, sampleRate: number): PitchTrack {
+  // Decimate by 2 for analysis at high sample rates (2-tap average is enough below 1.1 kHz)
+  const dec = sampleRate >= 32000 ? 2 : 1;
+  const ds = new Float32Array(Math.floor(mono.length / dec));
+  let peak = 0;
+  for (let i = 0; i < ds.length; i++) {
+    let v = 0;
+    for (let k = 0; k < dec; k++) v += mono[i * dec + k];
+    v /= dec;
+    ds[i] = v;
+    peak = Math.max(peak, Math.abs(v));
+  }
+  if (peak > 0) {
+    const g = 0.9 / peak;
+    for (let i = 0; i < ds.length; i++) ds[i] *= g;
+  }
+  const dsRate = sampleRate / dec;
+  const win = 1024;
+  const hopDs = 256;
+  const frames = ds.length >= win ? Math.floor((ds.length - win) / hopDs) + 1 : 0;
+  const centers = new Float64Array(frames);
+  const midi = new Float64Array(frames).fill(NaN);
+  for (let f = 0; f < frames; f++) {
+    centers[f] = (f * hopDs + win / 2) * dec;
+    const r = detectPitchAutocorrelation(ds.subarray(f * hopDs, f * hopDs + win), dsRate, {
+      minFreq: 70,
+      maxFreq: 1100,
+      clarityThreshold: 0.6,
+    });
+    if (r) midi[f] = freqToMidiFloat(r.freq);
+  }
+
+  // Clean-up: 3-point median, drop isolated frames and octave jumps
+  const cleaned = new Float64Array(frames).fill(NaN);
+  for (let f = 0; f < frames; f++) {
+    const vals = [midi[f - 1], midi[f], midi[f + 1]].filter((v) => v !== undefined && !Number.isNaN(v)) as number[];
+    if (Number.isNaN(midi[f]) || vals.length < 2) continue;
+    vals.sort((x, y) => x - y);
+    const med = vals[Math.floor(vals.length / 2)];
+    cleaned[f] = Math.abs(midi[f] - med) > 9 ? NaN : med;
+  }
+  // Fill single-frame gaps inside voiced regions
+  for (let f = 1; f < frames - 1; f++) {
+    if (Number.isNaN(cleaned[f]) && !Number.isNaN(cleaned[f - 1]) && !Number.isNaN(cleaned[f + 1])) {
+      cleaned[f] = (cleaned[f - 1] + cleaned[f + 1]) / 2;
+    }
+  }
+
+  // Vibrato-free center pitch: centered moving average restricted to the same voiced run
+  const hop = hopDs * dec;
+  const half = Math.max(1, Math.round((CENTER_WINDOW_SEC * sampleRate) / hop / 2));
+  const center = new Float64Array(frames).fill(NaN);
+  let runStart = -1;
+  for (let f = 0; f <= frames; f++) {
+    const voiced = f < frames && !Number.isNaN(cleaned[f]);
+    if (voiced && runStart < 0) runStart = f;
+    if (!voiced && runStart >= 0) {
+      const runEnd = f - 1;
+      for (let i = runStart; i <= runEnd; i++) {
+        const lo = Math.max(runStart, i - half);
+        const hi = Math.min(runEnd, i + half);
+        let sum = 0;
+        for (let k = lo; k <= hi; k++) sum += cleaned[k];
+        center[i] = sum / (hi - lo + 1);
+      }
+      runStart = -1;
+    }
+  }
+  return { centers, midi: cleaned, center, hop };
+}
+
+/** Pitch-class histogram (weighted by frame duration) of the vibrato-free pitch. */
+function pitchClassHistogram(track: PitchTrack): number[] {
+  const hist = new Array(12).fill(0);
+  for (let f = 0; f < track.center.length; f++) {
+    const c = track.center[f];
+    if (Number.isNaN(c)) continue;
+    hist[((Math.round(c) % 12) + 12) % 12] += 1;
+  }
+  return hist;
+}
+
+/** Estimates the key of a sung take from its audio channels. */
+export function estimateKeyFromChannels(channels: Float32Array[], sampleRate: number): KeyEstimate | null {
+  const track = trackPitch(mixToMono(channels), sampleRate);
+  const hist = pitchClassHistogram(track);
+  if (hist.reduce((a, b) => a + b, 0) < 20) return null; // < ~0.25 s of voiced material
+  return estimateKeyFromPitchClassHistogram(hist);
+}
+
+function mixToMono(channels: Float32Array[]): Float32Array {
+  if (channels.length === 1) return channels[0];
+  const n = channels[0].length;
+  const mono = new Float32Array(n);
+  for (const ch of channels) for (let i = 0; i < n; i++) mono[i] += ch[i] / channels.length;
+  return mono;
+}
+
+function nearestScaleNote(midi: number, key: MusicalKey | "chromatic"): number {
+  if (key === "chromatic") return Math.round(midi);
+  const steps = SCALE_STEPS[key.mode];
+  let best = Math.round(midi);
+  let bestDist = Infinity;
+  for (let m = Math.floor(midi) - 2; m <= Math.ceil(midi) + 2; m++) {
+    const pc = (((m - key.tonic) % 12) + 12) % 12;
+    if (!steps.includes(pc)) continue;
+    const d = Math.abs(m - midi);
+    if (d < bestDist) {
+      bestDist = d;
+      best = m;
+    }
+  }
+  return best;
+}
+
 /**
- * Processes a raw vocal AudioBuffer through an AI-guided Pitch Correction & Mastering Chain
- * (Granular pitch-nudging toward target scale degrees + High-pass + 3kHz Singer's Formant EQ + Optical Compression + Studio Reverb).
+ * Key-aware pitch correction (pure function, no Web Audio):
+ * 1. pitch track of the mono mix; 2. target = nearest note of the chosen scale for the
+ * vibrato-free center pitch, with hysteresis; 3. shift smoothed with a retune-speed time
+ * constant; 4. TD-PSOLA resynthesis (pitch-synchronous overlap-add on peak-aligned epochs),
+ * applied with the same marks to every channel. Duration is unchanged; unvoiced parts and
+ * in-tune notes are reproduced exactly.
+ */
+export function correctVocalPitch(
+  channels: Float32Array[],
+  sampleRate: number,
+  options: PitchCorrectionOptions
+): PitchCorrectionResult {
+  const strength = Math.max(0, Math.min(1, (options.strengthPercent || 0) / 100));
+  const length = channels[0]?.length ?? 0;
+  const mono = mixToMono(channels);
+  const track = trackPitch(mono, sampleRate);
+  const frames = track.midi.length;
+  const hist = pitchClassHistogram(track);
+  const voicedFrames = hist.reduce((a, b) => a + b, 0);
+  const estimatedKey = voicedFrames >= 20 ? estimateKeyFromPitchClassHistogram(hist) : null;
+  const sel = options.key ?? "auto";
+  const appliedKey: MusicalKey | "chromatic" =
+    sel === "auto"
+      ? estimatedKey
+        ? { tonic: estimatedKey.tonic, mode: estimatedKey.mode }
+        : "chromatic"
+      : sel;
+  const voicedRatio = frames > 0 ? voicedFrames / frames : 0;
+
+  if (strength <= 0 || length === 0 || voicedFrames === 0) {
+    return { channels: channels.map((c) => new Float32Array(c)), estimatedKey, appliedKey, voicedRatio };
+  }
+
+  // --- Correction curve (semitones per frame) ---
+  const tau = 0.02 + (1 - strength) * 0.18; // retune speed
+  const alpha = 1 - Math.exp(-(track.hop / sampleRate) / tau);
+  const HYSTERESIS = 0.3; // semitones: switch target only when clearly closer to another scale note
+  const shift = new Float64Array(frames);
+  let target = NaN;
+  let smoothed = 0;
+  for (let f = 0; f < frames; f++) {
+    const c = track.center[f];
+    if (Number.isNaN(c)) {
+      target = NaN;
+      smoothed = 0;
+      continue;
+    }
+    const candidate = nearestScaleNote(c, appliedKey);
+    if (Number.isNaN(target)) target = candidate;
+    else if (candidate !== target && Math.abs(c - target) - Math.abs(c - candidate) > HYSTERESIS) target = candidate;
+    const desired = Math.max(-1.5, Math.min(1.5, (target - c) * strength));
+    smoothed += alpha * (desired - smoothed);
+    shift[f] = smoothed;
+  }
+
+  // Per-sample helpers from the frame track
+  const frameAt = (n: number) => {
+    const f = Math.round((n - track.centers[0]) / track.hop);
+    return Math.max(0, Math.min(frames - 1, f));
+  };
+  const periodAt = (n: number): number | null => {
+    if (frames === 0) return null;
+    const m = track.midi[frameAt(n)];
+    return Number.isNaN(m) ? null : sampleRate / midiToFreq(m);
+  };
+  const ratioAt = (n: number): number => {
+    if (frames === 0) return 1;
+    const x = (n - track.centers[0]) / track.hop;
+    const f0 = Math.max(0, Math.min(frames - 1, Math.floor(x)));
+    const f1 = Math.min(frames - 1, f0 + 1);
+    const t = Math.max(0, Math.min(1, x - f0));
+    if (Number.isNaN(track.midi[f0]) && Number.isNaN(track.midi[f1])) return 1;
+    const s = shift[f0] * (1 - t) + shift[f1] * t;
+    return Math.pow(2, s / 12);
+  };
+
+  // --- Analysis epochs: peak-aligned in voiced parts, fixed 5 ms spacing elsewhere ---
+  const pseudo = Math.max(16, Math.round(0.005 * sampleRate));
+  const marks: number[] = [0];
+  const voicedMark: boolean[] = [false];
+  let n = 0;
+  while (true) {
+    const T = periodAt(n);
+    let next: number;
+    if (T) {
+      const predicted = n + T;
+      const radius = Math.max(2, Math.round(T / 4));
+      next = Math.round(predicted);
+      let best = -Infinity;
+      for (let k = Math.round(predicted) - radius; k <= Math.round(predicted) + radius; k++) {
+        if (k <= n || k >= length) continue;
+        if (mono[k] > best) {
+          best = mono[k];
+          next = k;
+        }
+      }
+    } else {
+      next = n + pseudo;
+    }
+    if (next >= length - 1) break;
+    marks.push(next);
+    voicedMark.push(!!periodAt(next));
+    n = next;
+  }
+  marks.push(length - 1);
+  voicedMark.push(false);
+
+  // --- TD-PSOLA synthesis ---
+  const out = channels.map(() => new Float64Array(length));
+  const wsum = new Float64Array(length);
+  let ts = marks[0];
+  let j = 0;
+  while (ts < length) {
+    while (j + 1 < marks.length && Math.abs(marks[j + 1] - ts) <= Math.abs(marks[j] - ts)) j++;
+    const ta = marks[j];
+    const left = j > 0 ? ta - marks[j - 1] : marks[1] - marks[0];
+    const right = j + 1 < marks.length ? marks[j + 1] - ta : left;
+    const r = voicedMark[j] ? ratioAt(ta) : 1;
+    const pos = Math.round(ts);
+    for (let k = -left; k <= right; k++) {
+      const src = ta + k;
+      const dst = pos + k;
+      if (src < 0 || src >= length || dst < 0 || dst >= length) continue;
+      // Asymmetric Hann halves: consecutive grains at analysis spacing sum exactly to 1
+      const w = k < 0 ? 0.5 * (1 + Math.cos((Math.PI * k) / left)) : k > 0 ? 0.5 * (1 + Math.cos((Math.PI * k) / right)) : 1;
+      for (let c = 0; c < channels.length; c++) out[c][dst] += w * channels[c][src];
+      wsum[dst] += w;
+    }
+    const step = right / r;
+    if (!(step > 0.5)) break;
+    ts += step;
+  }
+
+  const result = channels.map((orig, c) => {
+    const o = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+      const w = wsum[i];
+      o[i] = w > 1e-6 ? out[c][i] / Math.max(w, 0.5) : orig[i];
+    }
+    return o;
+  });
+  return { channels: result, estimatedKey, appliedKey, voicedRatio };
+}
+
+/**
+ * Processes a raw vocal AudioBuffer through the pitch correction and mastering chain:
+ * key-aware TD-PSOLA pitch correction (see correctVocalPitch) + 85 Hz high-pass +
+ * 3 kHz singer's-formant presence EQ + compressor + plate reverb. Stereo is preserved.
  */
 export async function processVocalBufferWithAiMastering(
   rawVocalBuffer: AudioBuffer,
@@ -913,58 +1268,29 @@ export async function processVocalBufferWithAiMastering(
     eqPresenceDb: number; // 0 to 8 dB
     compressionRatio: number; // 1.5 to 8
     reverbWetPercent: number; // 0 to 50
+    /** Target scale for the correction (default "auto": estimated from the take). */
+    key?: KeySelection;
+    /** Receives the key estimate and the scale actually applied. */
+    onPitchAnalysis?: (info: { estimatedKey: KeyEstimate | null; appliedKey: MusicalKey | "chromatic" }) => void;
   }
 ): Promise<AudioBuffer> {
   const sampleRate = rawVocalBuffer.sampleRate;
   const length = rawVocalBuffer.length;
+  const numChannels = Math.max(1, Math.min(2, rawVocalBuffer.numberOfChannels));
 
-  // Step 1: Time-domain granular pitch-centering pass on mono vocal signal
-  const inputData = rawVocalBuffer.getChannelData(0);
-  const pitchCorrectedData = new Float32Array(length);
-  const windowSize = 2048;
-  const hopSize = 1024;
-  const strength = Math.max(0, Math.min(1, options.pitchCorrectionPercent / 100));
-
-  if (strength > 0.05) {
-    for (let start = 0; start < length; start += hopSize) {
-      const end = Math.min(length, start + windowSize);
-      const slice = inputData.subarray(start, end);
-      let pitchShiftRatio = 1.0;
-
-      if (slice.length === windowSize) {
-        const detected = detectPitchAutocorrelation(slice, sampleRate);
-        if (detected) {
-          const midiFloat = freqToMidiFloat(detected.freq);
-          const nearestSemitone = Math.round(midiFloat);
-          const targetMidi =
-            midiFloat + (nearestSemitone - midiFloat) * strength;
-          const targetFreq = midiToFreq(targetMidi);
-          pitchShiftRatio = Math.max(
-            0.92,
-            Math.min(1.08, targetFreq / detected.freq)
-          );
-        }
-      }
-
-      // Resample grain with Hanning crossfade window
-      for (let i = 0; i < end - start; i++) {
-        const readIdx = start + i * pitchShiftRatio;
-        const idx0 = Math.min(length - 1, Math.floor(readIdx));
-        const idx1 = Math.min(length - 1, idx0 + 1);
-        const frac = readIdx - idx0;
-        const sample = inputData[idx0] * (1 - frac) + inputData[idx1] * frac;
-        const hann = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (end - start)));
-        pitchCorrectedData[start + i] += sample * hann;
-      }
-    }
-  } else {
-    pitchCorrectedData.set(inputData);
-  }
+  // Step 1: key-aware pitch correction on every channel (same analysis for all)
+  const inputs: Float32Array[] = [];
+  for (let c = 0; c < numChannels; c++) inputs.push(rawVocalBuffer.getChannelData(c));
+  const corrected = correctVocalPitch(inputs, sampleRate, {
+    strengthPercent: options.pitchCorrectionPercent,
+    key: options.key ?? "auto",
+  });
+  options.onPitchAnalysis?.({ estimatedKey: corrected.estimatedKey, appliedKey: corrected.appliedKey });
 
   // Step 2: OfflineAudioContext Mastering Chain (High-Pass + Formant Presence EQ + Compressor + Studio Reverb)
   const offlineCtx = new OfflineAudioContext(2, length, sampleRate);
-  const workBuffer = offlineCtx.createBuffer(1, length, sampleRate);
-  workBuffer.copyToChannel(pitchCorrectedData, 0);
+  const workBuffer = offlineCtx.createBuffer(numChannels, length, sampleRate);
+  corrected.channels.forEach((data, c) => workBuffer.copyToChannel(data as Float32Array<ArrayBuffer>, c));
 
   const source = offlineCtx.createBufferSource();
   source.buffer = workBuffer;

@@ -1,6 +1,7 @@
 import express from "express";
 import type { NextFunction, Response } from "express";
 import path from "path";
+import http from "http";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
@@ -797,10 +798,14 @@ Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli so
     res.status(err?.status && err.status < 500 ? err.status : 500).json({ error: "Errore interno del server." });
   });
 
+  // One HTTP server for the app and (in development) Vite's HMR WebSocket, so dev mode does not
+  // need a separate fixed port (24678) and several dev instances can run side by side.
+  const server = http.createServer(app);
+
   if (!IS_PRODUCTION) {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: { server } },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -813,7 +818,7 @@ Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli so
     });
   }
 
-  const server = app.listen(PORT, HOST, () => {
+  server.listen(PORT, HOST, () => {
     console.log(
       `VoceViva Server (${IS_PRODUCTION ? "produzione" : "sviluppo"}) in ascolto su http://${HOST === "0.0.0.0" ? "localhost" : HOST}:${PORT}`
     );
