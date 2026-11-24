@@ -89,6 +89,7 @@ jobs:
             "$AAPT2" dump badging "$apk" | grep -E "^package:|^application-label:|^uses-permission:|^sdkVersion:|^targetSdkVersion:"
             "$AAPT2" dump badging "$apk" | grep -q "android.permission.RECORD_AUDIO" || { echo "::error::RECORD_AUDIO mancante"; exit 1; }
             unzip -l "$apk" | grep -q "assets/public/index.html" || { echo "::error::interfaccia web mancante nell'APK"; exit 1; }
+            "$(dirname "$AAPT2")/apksigner" verify --verbose --print-certs "$apk" | grep -E "Verified using|Signer #1 certificate (DN|SHA-256)"
           done
 
       - uses: actions/upload-artifact@v4
