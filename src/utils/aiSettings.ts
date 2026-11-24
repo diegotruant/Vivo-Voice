@@ -79,6 +79,26 @@ export function saveServerUrl(url: string): void {
   window.dispatchEvent(new Event(AI_SETTINGS_CHANGED_EVENT));
 }
 
+/**
+ * How the AI coach is reached:
+ * - "diretta": from this device straight to the provider with the user's key (no server needed);
+ * - "server": through a VoceViva server (same origin in the browser, or the "Server VoceViva" URL).
+ */
+export type ConnectionMode = "diretta" | "server";
+const CONNECTION_MODE_KEY = "voceviva.connection-mode.v1";
+
+/** Saved choice; default: diretta in the Android app without a server URL, server in the browser. */
+export function getConnectionMode(): ConnectionMode {
+  const saved = localStorage.getItem(CONNECTION_MODE_KEY);
+  if (saved === "diretta" || saved === "server") return saved;
+  return isNativeApp() && !getServerUrl() ? "diretta" : "server";
+}
+
+export function saveConnectionMode(mode: ConnectionMode): void {
+  localStorage.setItem(CONNECTION_MODE_KEY, mode);
+  window.dispatchEvent(new Event(AI_SETTINGS_CHANGED_EVENT));
+}
+
 /** Absolute or same-origin URL for a server API path such as "/api/llm/test". */
 export function apiUrl(path: string): string {
   return getServerUrl() + path;
@@ -129,11 +149,20 @@ export function aiHeaders(settings: AiSettings | null = loadAiSettings()): Recor
   return h;
 }
 
-/** POST JSON to a VoceViva coach endpoint, attaching the user's AI settings. */
-export function coachFetch(path: string, body: unknown, settings?: AiSettings | null): Promise<Response> {
+/**
+ * POST JSON to a VoceViva coach endpoint. In "modalità diretta" the request runs on this device
+ * (provider called with the user's key, see directCoach.ts) and returns an equivalent Response;
+ * otherwise it goes to the VoceViva server with the user's AI settings in the X-LLM-* headers.
+ */
+export async function coachFetch(path: string, body: unknown, settings?: AiSettings | null): Promise<Response> {
+  const s = settings === undefined ? loadAiSettings() : settings;
+  if (getConnectionMode() === "diretta") {
+    const { runCoachDirect } = await import("./directCoach"); // provider SDKs load only in this mode
+    return runCoachDirect(path, body, s);
+  }
   return fetch(apiUrl(path), {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...aiHeaders(settings === undefined ? loadAiSettings() : settings) },
+    headers: { "Content-Type": "application/json", ...aiHeaders(s) },
     body: JSON.stringify(body),
   });
 }

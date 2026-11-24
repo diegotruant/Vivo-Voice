@@ -30,8 +30,13 @@ Dal pulsante **"Configura Coach AI"** in alto, ogni utente sceglie il provider e
 | Google Gemini | Può ascoltare anche l'audio registrato; abilita la voce sintetica del coach. |
 | OpenAI / compatibile | Indicare il nome del modello. |
 
-La chiave resta nel browser (localStorage) e viene inoltrata dal server al provider ad ogni richiesta,
-senza essere salvata o registrata. In alternativa il gestore del server può configurare una chiave in `.env`
+Due modalità di connessione (stesso pannello):
+- **Diretta dal dispositivo:** il browser o l'app Android chiamano il provider con la chiave dell'utente, senza server
+  (predefinita nell'app Android).
+- **Tramite server VoceViva:** la chiave resta nel browser (localStorage) e viene inoltrata dal server al provider ad ogni
+  richiesta, senza essere salvata o registrata (predefinita nel browser).
+
+Prompt, schemi e consigli di riserva sono gli stessi nei due casi (`shared/coach.ts`). In alternativa il gestore del server può configurare una chiave in `.env`
 (vedi `.env.example`). Senza chiave l'app funziona comunque e il coach mostra consigli generici offline,
 segnalati come tali.
 
@@ -93,10 +98,12 @@ Apri la scheda **Actions** del repository → ultima esecuzione di *Android APK*
 **Installare sul telefono:** copia `VoceViva-…-debug.apk` sul telefono, aprilo e consenti l'installazione da
 "origini sconosciute". Al primo esercizio concedi il permesso del microfono.
 
-**Collegare il Coach AI:** nell'app, "Configura Coach AI" → **Server VoceViva** (indirizzo https del tuo server) →
-provider e chiave. Per preimpostare il server in tutte le build, crea la variabile di repository
-`VOCEVIVA_SERVER_URL` (Settings → Secrets and variables → Actions → Variables).
-Il server accetta già le richieste dell'app (CORS per `https://localhost`); altri domini in `CORS_ORIGINS`.
+**Collegare il Coach AI:** nell'app, "Configura Coach AI" → **Connessione: Diretta dal dispositivo** (predefinita
+nell'app) → provider (Claude consigliato) e la tua chiave → "Prova collegamento". In modalità diretta il telefono
+chiama il provider con la tua chiave: **non serve nessun server**. La chiave resta sul dispositivo.
+In alternativa scegli **Tramite server VoceViva** e indica l'indirizzo https di un server pubblicato; per preimpostarlo
+in tutte le build crea la variabile di repository `VOCEVIVA_SERVER_URL` (Settings → Secrets and variables → Actions →
+Variables). Il server accetta già le richieste dell'app (CORS per `https://localhost`); altri domini in `CORS_ORIGINS`.
 
 **Versione firmata per il Play Store (facoltativa):** crea un keystore
 (`keytool -genkeypair -v -keystore voceviva.jks -alias voceviva -keyalg RSA -keysize 2048 -validity 10000`)

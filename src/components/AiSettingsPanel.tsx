@@ -11,6 +11,9 @@ import {
   getServerUrl,
   saveServerUrl,
   isNativeApp,
+  getConnectionMode,
+  saveConnectionMode,
+  type ConnectionMode,
 } from "../utils/aiSettings";
 
 interface ServerConfig {
@@ -34,7 +37,15 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
   const [serverConfig, setServerConfig] = useState<ServerConfig | null>(null);
   const [hasSaved, setHasSaved] = useState(false);
   const [serverUrl, setServerUrl] = useState("");
+  const [mode, setMode] = useState<ConnectionMode>("server");
   const native = isNativeApp();
+
+  const loadServerConfig = () => {
+    fetch(apiUrl("/api/llm/server-config"))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((c) => setServerConfig(c))
+      .catch(() => setServerConfig(null));
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -48,10 +59,10 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
     }
     setTest({ status: "idle" });
     setServerUrl(getServerUrl());
-    fetch(apiUrl("/api/llm/server-config"))
-      .then((r) => (r.ok ? r.json() : null))
-      .then((c) => setServerConfig(c))
-      .catch(() => setServerConfig(null));
+    const m = getConnectionMode();
+    setMode(m);
+    if (m === "server") loadServerConfig();
+    else setServerConfig(null);
   }, [open]);
 
   useEffect(() => {
@@ -74,8 +85,20 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
     setTest({ status: "idle" });
   };
 
+  const selectMode = (m: ConnectionMode) => {
+    setMode(m);
+    setTest({ status: "idle" });
+    if (m === "server") loadServerConfig();
+  };
+
   const runTest = async () => {
     setTest({ status: "testing" });
+    if (mode === "diretta") {
+      const { testDirectConnection } = await import("../utils/directCoach");
+      const r = await testDirectConnection(current);
+      setTest(r.ok ? { status: "ok", model: r.model } : { status: "error", message: r.error });
+      return;
+    }
     try {
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
@@ -94,14 +117,16 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
     } catch {
       setTest({
         status: "error",
-        message: native && !serverUrl.trim()
-          ? "Indica l'indirizzo del Server VoceViva qui sopra."
-          : "Server VoceViva non raggiungibile.",
+        message:
+          native && !serverUrl.trim()
+            ? "Indica l'indirizzo del Server VoceViva qui sopra."
+            : "Server VoceViva non raggiungibile.",
       });
     }
   };
 
   const save = () => {
+    saveConnectionMode(mode);
     saveServerUrl(serverUrl);
     saveAiSettings(current);
     setHasSaved(true);
@@ -115,9 +140,7 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
     setTest({ status: "idle" });
   };
 
-  const serverProviderLabel = serverConfig?.serverProvider
-    ? providerInfo(serverConfig.serverProvider).label
-    : null;
+  const serverProviderLabel = serverConfig?.serverProvider ? providerInfo(serverConfig.serverProvider).label : null;
 
   return (
     <div
@@ -141,14 +164,62 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
               Scegli il modello linguistico che genera i giudizi del Maestro e inserisci la tua chiave API.
             </p>
           </div>
-          <button type="button" onClick={onClose} className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-white" aria-label="Chiudi">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-white"
+            aria-label="Chiudi"
+          >
             <X className="h-5 w-5" />
           </button>
         </div>
 
-        {(native || serverUrl) && (
-          <div className="mt-5">
-            <label htmlFor="server-url" className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-400">
+        <fieldset className="mt-5">
+          <legend className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Connessione</legend>
+          <div className="grid gap-2">
+            {[
+              {
+                id: "diretta" as const,
+                label: native ? "Diretta dal dispositivo (consigliata per l'app)" : "Diretta dal dispositivo",
+                note: "Il telefono contatta direttamente il provider scelto con la tua chiave. Non serve nessun server.",
+              },
+              {
+                id: "server" as const,
+                label: "Tramite server VoceViva",
+                note: native
+                  ? "Le richieste passano da un server VoceViva pubblicato online (indirizzo qui sotto)."
+                  : "Le richieste passano dal server che ospita questa pagina.",
+              },
+            ].map((o) => (
+              <label
+                key={o.id}
+                className={`flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition-colors ${
+                  mode === o.id ? "border-sky-500 bg-sky-500/10" : "border-slate-700 hover:border-slate-500"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="ai-connection"
+                  value={o.id}
+                  checked={mode === o.id}
+                  onChange={() => selectMode(o.id)}
+                  className="mt-1 accent-sky-500"
+                />
+                <span>
+                  <span className="block text-sm font-medium text-white">{o.label}</span>
+                  <span className="mt-0.5 block text-[11px] leading-snug text-slate-400">{o.note}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+
+        {mode === "server" && (native || serverUrl) && (
+          <div className="mt-4">
+            <label
+              htmlFor="server-url"
+              className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-400"
+            >
               Server VoceViva
             </label>
             <input
@@ -165,7 +236,7 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
               className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-white placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
             />
             <p className="mt-1 text-[11px] leading-snug text-slate-500">
-              L'app Android usa questo server per il Coach AI. Tutti gli esercizi con il microfono funzionano anche senza.
+              Indirizzo https del tuo server VoceViva. Tutti gli esercizi con il microfono funzionano anche senza.
             </p>
           </div>
         )}
@@ -244,7 +315,10 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
           </div>
 
           <div>
-            <label htmlFor="ai-model" className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-400">
+            <label
+              htmlFor="ai-model"
+              className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-400"
+            >
               Modello
             </label>
             <input
@@ -261,9 +335,12 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
             />
           </div>
 
-          {provider === "openai" && serverConfig?.customBaseUrlAllowed && (
+          {provider === "openai" && (mode === "diretta" || serverConfig?.customBaseUrlAllowed) && (
             <div>
-              <label htmlFor="ai-base-url" className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-400">
+              <label
+                htmlFor="ai-base-url"
+                className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-400"
+              >
                 URL base (opzionale, servizi compatibili OpenAI)
               </label>
               <input
@@ -285,8 +362,8 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
               test.status === "ok"
                 ? "bg-emerald-500/10 text-emerald-300"
                 : test.status === "error"
-                ? "bg-rose-500/10 text-rose-300"
-                : "bg-slate-800 text-slate-300"
+                  ? "bg-rose-500/10 text-rose-300"
+                  : "bg-slate-800 text-slate-300"
             }`}
           >
             {test.status === "testing" && <Loader2 className="h-4 w-4 shrink-0 animate-spin" />}
@@ -302,17 +379,24 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
 
         <div className="mt-4 flex items-start gap-2 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-[11px] leading-snug text-slate-400">
           <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-500" />
-          <span>
-            La chiave resta salvata solo in questo browser. Ad ogni richiesta viene inviata al server VoceViva
-            esclusivamente per inoltrarla al provider scelto: non viene memorizzata né registrata. I costi d'uso
-            sono addebitati sul tuo account del provider.
-            {serverProviderLabel && !hasSaved && (
-              <> Senza una tua chiave l'app usa quella configurata sul server ({serverProviderLabel}).</>
-            )}
-            {!serverProviderLabel && !hasSaved && (
-              <> Senza chiave il coach mostra solo consigli generici offline.</>
-            )}
-          </span>
+          {mode === "diretta" ? (
+            <span>
+              La chiave resta salvata solo su questo dispositivo e viene inviata soltanto al provider scelto, insieme
+              alle misure della sessione (l'audio registrato solo con Gemini). Nessun server VoceViva è coinvolto. I
+              costi d'uso sono addebitati sul tuo account del provider.
+              {!hasSaved && <> Senza chiave il coach mostra solo consigli generici offline.</>}
+            </span>
+          ) : (
+            <span>
+              La chiave resta salvata solo in questo browser. Ad ogni richiesta viene inviata al server VoceViva
+              esclusivamente per inoltrarla al provider scelto: non viene memorizzata né registrata. I costi d'uso sono
+              addebitati sul tuo account del provider.
+              {serverProviderLabel && !hasSaved && (
+                <> Senza una tua chiave l'app usa quella configurata sul server ({serverProviderLabel}).</>
+              )}
+              {!serverProviderLabel && !hasSaved && <> Senza chiave il coach mostra solo consigli generici offline.</>}
+            </span>
+          )}
         </div>
 
         <div className="mt-5 flex flex-wrap items-center justify-between gap-2">
