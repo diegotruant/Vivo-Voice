@@ -80,3 +80,29 @@ Variabili d'ambiente del server (vedi `.env.example`):
 Sicurezza: le chiavi API inviate dagli utenti non vengono salvate né registrate nei log; le richieste malformate
 o troppo grandi ricevono un errore JSON; l'audio è accettato solo nei formati `audio/webm`, `wav`, `ogg`, `mpeg`, `mp4`.
 Il microfono richiede HTTPS (o `localhost`): pubblica l'app dietro un proxy con certificato TLS.
+
+## App Android (APK)
+
+L'app Android è generata con [Capacitor](https://capacitorjs.com/): l'interfaccia è dentro l'APK, mentre il
+Coach AI usa il server VoceViva (serve un server pubblicato, vedi "Messa in produzione").
+
+**Scaricare l'APK:** ad ogni push GitHub Actions compila l'app (workflow *Android APK*).
+Apri la scheda **Actions** del repository → ultima esecuzione di *Android APK* → sezione **Artifacts** →
+`VoceViva-android-N` (file zip con l'APK). Pubblicando una *Release* su GitHub, l'APK viene allegato alla release.
+
+**Installare sul telefono:** copia `VoceViva-…-debug.apk` sul telefono, aprilo e consenti l'installazione da
+"origini sconosciute". Al primo esercizio concedi il permesso del microfono.
+
+**Collegare il Coach AI:** nell'app, "Configura Coach AI" → **Server VoceViva** (indirizzo https del tuo server) →
+provider e chiave. Per preimpostare il server in tutte le build, crea la variabile di repository
+`VOCEVIVA_SERVER_URL` (Settings → Secrets and variables → Actions → Variables).
+Il server accetta già le richieste dell'app (CORS per `https://localhost`); altri domini in `CORS_ORIGINS`.
+
+**Versione firmata per il Play Store (facoltativa):** crea un keystore
+(`keytool -genkeypair -v -keystore voceviva.jks -alias voceviva -keyalg RSA -keysize 2048 -validity 10000`)
+e aggiungi i segreti di repository `ANDROID_KEYSTORE_BASE64` (`base64 -w0 voceviva.jks`),
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`: il workflow produrrà anche
+l'APK firmato e il bundle `.aab` per il Play Store. Conserva il keystore: senza, non potrai aggiornare l'app pubblicata.
+
+**Sviluppo locale con Android Studio:** `bun run android:sync` e poi `bun run android:open`.
+L'identificativo dell'app è `it.voceviva.app` (`capacitor.config.ts`): va deciso prima della prima pubblicazione.

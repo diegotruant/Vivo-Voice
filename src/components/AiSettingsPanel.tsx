@@ -7,6 +7,10 @@ import {
   loadAiSettings,
   providerInfo,
   saveAiSettings,
+  apiUrl,
+  getServerUrl,
+  saveServerUrl,
+  isNativeApp,
 } from "../utils/aiSettings";
 
 interface ServerConfig {
@@ -29,6 +33,8 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
   const [test, setTest] = useState<TestState>({ status: "idle" });
   const [serverConfig, setServerConfig] = useState<ServerConfig | null>(null);
   const [hasSaved, setHasSaved] = useState(false);
+  const [serverUrl, setServerUrl] = useState("");
+  const native = isNativeApp();
 
   useEffect(() => {
     if (!open) return;
@@ -41,7 +47,8 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
       setBaseUrl(saved.baseUrl);
     }
     setTest({ status: "idle" });
-    fetch("/api/llm/server-config")
+    setServerUrl(getServerUrl());
+    fetch(apiUrl("/api/llm/server-config"))
       .then((r) => (r.ok ? r.json() : null))
       .then((c) => setServerConfig(c))
       .catch(() => setServerConfig(null));
@@ -77,15 +84,25 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
         "X-LLM-Model": current.model,
       };
       if (current.provider === "openai" && current.baseUrl) headers["X-LLM-Base-Url"] = current.baseUrl;
-      const res = await fetch("/api/llm/test", { method: "POST", headers, body: "{}" });
+      const res = await fetch(serverUrl.trim().replace(/\/+$/, "") + "/api/llm/test", {
+        method: "POST",
+        headers,
+        body: "{}",
+      });
       const data = await res.json();
       setTest(data.ok ? { status: "ok", model: data.model } : { status: "error", message: data.error });
     } catch {
-      setTest({ status: "error", message: "Server VoceViva non raggiungibile." });
+      setTest({
+        status: "error",
+        message: native && !serverUrl.trim()
+          ? "Indica l'indirizzo del Server VoceViva qui sopra."
+          : "Server VoceViva non raggiungibile.",
+      });
     }
   };
 
   const save = () => {
+    saveServerUrl(serverUrl);
     saveAiSettings(current);
     setHasSaved(true);
     onClose();
@@ -128,6 +145,30 @@ export function AiSettingsPanel({ open, onClose }: { open: boolean; onClose: () 
             <X className="h-5 w-5" />
           </button>
         </div>
+
+        {(native || serverUrl) && (
+          <div className="mt-5">
+            <label htmlFor="server-url" className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Server VoceViva
+            </label>
+            <input
+              id="server-url"
+              type="url"
+              inputMode="url"
+              spellCheck={false}
+              value={serverUrl}
+              onChange={(e) => {
+                setServerUrl(e.target.value);
+                setTest({ status: "idle" });
+              }}
+              placeholder="https://il-tuo-server-voceviva.example"
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-white placeholder:text-slate-600 focus:border-sky-500 focus:outline-none"
+            />
+            <p className="mt-1 text-[11px] leading-snug text-slate-500">
+              L'app Android usa questo server per il Coach AI. Tutti gli esercizi con il microfono funzionano anche senza.
+            </p>
+          </div>
+        )}
 
         <fieldset className="mt-5">
           <legend className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Provider</legend>

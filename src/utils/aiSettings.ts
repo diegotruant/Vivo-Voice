@@ -52,6 +52,37 @@ export const AI_PROVIDERS: AiProviderInfo[] = [
 ];
 
 const STORAGE_KEY = "voceviva.ai-settings.v1";
+const SERVER_URL_KEY = "voceviva.server-url.v1";
+
+/** True inside the Android app (Capacitor WebView), false in a normal browser. */
+export function isNativeApp(): boolean {
+  const cap = (window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor;
+  return !!cap?.isNativePlatform?.();
+}
+
+/**
+ * Base URL of the VoceViva server for API calls.
+ * - Browser: empty → same origin as the page.
+ * - Android app: the page is served from the APK, so the server must be explicit:
+ *   user setting ("Server VoceViva"), else VITE_API_BASE_URL baked in at build time.
+ */
+export function getServerUrl(): string {
+  const saved = localStorage.getItem(SERVER_URL_KEY)?.trim();
+  const fromBuild = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
+  return (saved || fromBuild || "").replace(/\/+$/, "");
+}
+
+export function saveServerUrl(url: string): void {
+  const clean = url.trim().replace(/\/+$/, "");
+  if (clean) localStorage.setItem(SERVER_URL_KEY, clean);
+  else localStorage.removeItem(SERVER_URL_KEY);
+  window.dispatchEvent(new Event(AI_SETTINGS_CHANGED_EVENT));
+}
+
+/** Absolute or same-origin URL for a server API path such as "/api/llm/test". */
+export function apiUrl(path: string): string {
+  return getServerUrl() + path;
+}
 export const AI_SETTINGS_CHANGED_EVENT = "voceviva:ai-settings-changed";
 export const OPEN_AI_SETTINGS_EVENT = "voceviva:open-ai-settings";
 
@@ -100,7 +131,7 @@ export function aiHeaders(settings: AiSettings | null = loadAiSettings()): Recor
 
 /** POST JSON to a VoceViva coach endpoint, attaching the user's AI settings. */
 export function coachFetch(path: string, body: unknown, settings?: AiSettings | null): Promise<Response> {
-  return fetch(path, {
+  return fetch(apiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json", ...aiHeaders(settings === undefined ? loadAiSettings() : settings) },
     body: JSON.stringify(body),

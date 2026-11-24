@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">VoceViva</string>
+    <string name="title_activity_main">VoceViva</string>
+    <string name="package_name">it.voceviva.app</string>
+    <string name="custom_url_scheme">it.voceviva.app</string>
+</resources>

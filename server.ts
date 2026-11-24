@@ -205,6 +205,33 @@ async function startServer() {
     next();
   });
 
+  // CORS for the Android app (Capacitor serves the UI from https://localhost inside the WebView)
+  // plus any extra origins in CORS_ORIGINS (comma-separated). Same-origin browser use needs none.
+  const corsOrigins = new Set([
+    "https://localhost",
+    "capacitor://localhost",
+    "http://localhost",
+    ...(process.env.CORS_ORIGINS ?? "")
+      .split(",")
+      .map((o) => o.trim().replace(/\/+$/, ""))
+      .filter(Boolean),
+  ]);
+  app.use("/api", (req, res, next) => {
+    const origin = req.get("origin");
+    if (origin && corsOrigins.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, X-LLM-Provider, X-LLM-Api-Key, X-LLM-Model, X-LLM-Base-Url"
+      );
+      res.setHeader("Access-Control-Max-Age", "600");
+    }
+    if (req.method === "OPTIONS") return res.sendStatus(origin && corsOrigins.has(origin) ? 204 : 403);
+    next();
+  });
+
   rateLimitStore = await createRateLimitStore();
   console.log(`Limite richieste AI: archivio in ${rateLimitStore.kind}.`);
   const aiLimiter = perIpLimiter(
