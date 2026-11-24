@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { coachFetch } from "../utils/aiSettings";
 import {
   Play,
   Square,
@@ -485,10 +486,7 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
   const requestMaestroFeedback = async (scorePercent: number | null) => {
     setIsRequestingCoach(true);
     try {
-      const res = await fetch("/api/vocal-coach/lesson-coach", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const res = await coachFetch("/api/vocal-coach/lesson-coach", {
           moduleType: "Solfeggio Cantato & Ritmico",
           exerciseName: selectedLesson.title,
           scorePercent: scorePercent ?? "non misurato",
@@ -498,8 +496,7 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
             (scorePercent === null
               ? " Eseguito senza microfono: intonazione non misurata."
               : ` Note intonate (entro ±35 cent): ${Math.round((scorePercent / 100) * selectedLesson.notes.length)}/${selectedLesson.notes.length}.`),
-        }),
-      });
+        });
       const data = await res.json();
       setCoachFeedback(data);
     } catch (e) {

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
+import { coachFetch } from "../utils/aiSettings";
 import {
   Mic,
   MicOff,
@@ -381,10 +382,7 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
 
         let data: AiAnalysisResult;
         try {
-          const res = await fetch("/api/vocal-coach/analyze", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
+          const res = await coachFetch("/api/vocal-coach/analyze", {
               exerciseTitle: selectedExercise.title,
               voiceType: currentRegister.name,
               accuracyPercent: acc,
@@ -394,8 +392,7 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
               criticalNotes: Array.from(missedMidis),
               audioBase64,
               audioMimeType,
-            }),
-          });
+            });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           data = await res.json();
         } catch (aiErr) {

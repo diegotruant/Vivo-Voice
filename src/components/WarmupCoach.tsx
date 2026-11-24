@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { coachFetch } from "../utils/aiSettings";
 import {
   Play,
   Square,
@@ -391,17 +392,13 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
             : "Microfono non attivo: controllo del volume anti-sforzo non misurato."
         }`;
     try {
-      const res = await fetch("/api/vocal-coach/lesson-coach", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const res = await coachFetch("/api/vocal-coach/lesson-coach", {
           moduleType: "Riscaldamento SOVTE (Vocal Fry & Lip Trill)",
           exerciseName: activeStage.title,
           scorePercent: safePercent ?? "non misurato",
           voiceType: currentRegister.name,
           details,
-        }),
-      });
+        });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setCoachFeedback(data);

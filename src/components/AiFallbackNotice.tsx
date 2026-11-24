@@ -1,5 +1,6 @@
 import React from "react";
 import { AlertTriangle } from "lucide-react";
+import { loadAiSettings, openAiSettings } from "../utils/aiSettings";
 
 /**
  * Shown whenever a server response carries `isFallback: true`: the text the user is
@@ -12,7 +13,10 @@ export function AiFallbackNotice({ show }: { show?: boolean }) {
       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
       <span>
         Coach AI non disponibile: questo è un consiglio generico offline, non un'analisi della tua
-        esecuzione.
+        esecuzione.{" "}
+        <button type="button" onClick={openAiSettings} className="font-semibold underline hover:text-amber-200">
+          {loadAiSettings() ? "Controlla le impostazioni del Coach AI" : "Configura il Coach AI"}
+        </button>
       </span>
     </div>
   );

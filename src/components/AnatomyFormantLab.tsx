@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from "react";
+import { coachFetch } from "../utils/aiSettings";
 import {
   Volume2,
   Send,
@@ -510,10 +511,7 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
     setQuestion(trimmed);
     setIsLoadingAsk(true);
     try {
-      const res = await fetch("/api/vocal-coach/ask", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const res = await coachFetch("/api/vocal-coach/ask", {
           question: trimmed,
           voiceType:
             VOICE_REGISTERS.find((r) => r.id === selectedRegisterId)?.name ??
@@ -521,8 +519,7 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
           lowestNote: lowNoteLabel,
           highestNote: highNoteLabel,
           recentAccuracy: recentAccuracy ?? "non misurato",
-        }),
-      });
+        });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: AiConsultationResponse = await res.json();
       setConsultation(data);

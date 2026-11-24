@@ -4,6 +4,16 @@
  */
 
 import React, { useState, useCallback, useRef, useEffect } from "react";
+import { KeyRound } from "lucide-react";
+import {
+  coachFetch,
+  loadAiSettings,
+  providerInfo,
+  AI_SETTINGS_CHANGED_EVENT,
+  OPEN_AI_SETTINGS_EVENT,
+  AiSettings,
+} from "./utils/aiSettings";
+import { AiSettingsPanel } from "./components/AiSettingsPanel";
 import {
   ResponsiveContainer,
   AreaChart,
@@ -50,6 +60,19 @@ export default function App() {
     "Sostenuto & Appoggio Diaframmatico"
   );
   const [isPlayingTts, setIsPlayingTts] = useState<boolean>(false);
+  const [aiSettingsOpen, setAiSettingsOpen] = useState<boolean>(false);
+  const [aiSettings, setAiSettings] = useState<AiSettings | null>(() => loadAiSettings());
+
+  useEffect(() => {
+    const onChanged = () => setAiSettings(loadAiSettings());
+    const onOpen = () => setAiSettingsOpen(true);
+    window.addEventListener(AI_SETTINGS_CHANGED_EVENT, onChanged);
+    window.addEventListener(OPEN_AI_SETTINGS_EVENT, onOpen);
+    return () => {
+      window.removeEventListener(AI_SETTINGS_CHANGED_EVENT, onChanged);
+      window.removeEventListener(OPEN_AI_SETTINGS_EVENT, onOpen);
+    };
+  }, []);
 
   const [sessions, setSessions] = useState<VocalSessionRecord[]>(() => {
     try {
@@ -161,11 +184,7 @@ export default function App() {
         audioPlayerRef.current = null;
       }
 
-      const res = await fetch("/api/vocal-coach/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
+      const res = await coachFetch("/api/vocal-coach/tts", { text });
 
       if (res.ok) {
         const data = await res.json();
@@ -296,6 +315,19 @@ export default function App() {
 
         {/* Zone 3: 1 primary action */}
         <div className="flex items-center gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={() => setAiSettingsOpen(true)}
+            title="Impostazioni Coach AI"
+            className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-lg border transition-colors whitespace-nowrap ${
+              aiSettings
+                ? "border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"
+                : "border-amber-500/40 text-amber-300 hover:bg-amber-500/10"
+            }`}
+          >
+            <KeyRound className="w-3.5 h-3.5" />
+            {aiSettings ? `Coach AI: ${providerInfo(aiSettings.provider).label}` : "Configura Coach AI"}
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -614,6 +646,7 @@ export default function App() {
           </div>
         </div>
       </footer>
+      <AiSettingsPanel open={aiSettingsOpen} onClose={() => setAiSettingsOpen(false)} />
     </div>
   );
 }

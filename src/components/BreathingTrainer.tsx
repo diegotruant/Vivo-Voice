@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { coachFetch } from "../utils/aiSettings";
 import {
   Play,
   Square,
@@ -310,16 +311,12 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
         ? `Microfono non attivo: stabilità non misurata. Cicli completati: ${completedCycles}.`
         : `Stabilità del flusso d'aria misurata sulla sibilante durante la fase di emissione: ${measured}% (fasi di emissione misurate: ${measuredExhales}). Cicli completati: ${completedCycles}.`;
     try {
-      const res = await fetch("/api/vocal-coach/lesson-coach", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const res = await coachFetch("/api/vocal-coach/lesson-coach", {
           moduleType: "Respirazione Costo-Diaframmatica & Appoggio",
           exerciseName: `Ciclo ${inhaleSec}s Inspirazione - ${suspendSec}s Appoggio - ${exhaleSec}s Emissione SSS`,
           scorePercent: measured ?? "non misurato",
           details,
-        }),
-      });
+        });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setCoachBreathEvaluation(data);

@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
+import { coachFetch } from "../utils/aiSettings";
 import {
   Upload,
   Mic,
@@ -410,10 +411,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
           `al secondo ${p.timeSec.toFixed(1)}s sulla nota ${p.noteLabel}: ${p.issue} (${p.centsOff > 0 ? `+${p.centsOff}` : p.centsOff} cent)`
       );
 
-      const res = await fetch("/api/vocal-coach/song-analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const res = await coachFetch("/api/vocal-coach/song-analyze", {
           songTitle: songName,
           voiceType: currentRegister.name,
           accuracyPercent: acc,
@@ -424,8 +422,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
           lowestSungNote: lowN,
           highestSungNote: highN,
           weakPassages: weakStrings,
-        }),
-      });
+        });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: SongDiagnosticResponse = await res.json();
       setAiDiagnosis(data);

@@ -2,29 +2,33 @@ import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
+import type { Request } from "express";
+import {
+  resolveLlmConfig,
+  generateJson,
+  serverDefaultProvider,
+  describeLlmError,
+  logLlmError,
+  LlmNotConfiguredError,
+  DEFAULT_MODELS,
+  LLM_PROVIDERS,
+} from "./llm";
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      "User-Agent": "aistudio-build",
-    },
-  },
-});
-
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
-if (!GEMINI_KEY || GEMINI_KEY === "MY_GEMINI_API_KEY" || GEMINI_KEY.trim() === "") {
+const startupProvider = serverDefaultProvider();
+if (!startupProvider) {
   console.warn(
-    "\n⚠️  GEMINI_API_KEY mancante o segnaposto: il Coach AI non è attivo.\n" +
-      "   Gli endpoint /api/vocal-coach/* risponderanno con consigli generici offline (isFallback: true).\n" +
-      "   Imposta GEMINI_API_KEY nel file .env per abilitare l'analisi AI.\n"
+    "\n⚠️  Nessuna chiave AI configurata sul server (ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY).\n" +
+      "   Gli utenti possono inserire la propria chiave nelle Impostazioni Coach AI dell'app;\n" +
+      "   senza chiave gli endpoint /api/vocal-coach/* rispondono con consigli generici offline (isFallback: true).\n"
   );
+} else {
+  console.log(`Coach AI: chiave del server configurata per il provider "${startupProvider}".`);
 }
 
 /** Rule appended to every coach prompt: feedback must be grounded in the measurements sent. */
@@ -63,6 +67,66 @@ function parseModelJson(text: string | undefined, required: string[]): Record<st
   return parsed;
 }
 
+type GeminiStylePart = { text?: string; inlineData?: { mimeType: string; data: string } };
+
+/**
+ * Runs a structured (JSON) coach request on the provider configured for this request
+ * (user key from the app settings, or the server key). Returns `{ text }` with the JSON text.
+ */
+async function callModel(
+  req: Request,
+  r: {
+    contents: string | { parts: GeminiStylePart[] };
+    config: { systemInstruction: string; responseMimeType?: string; responseSchema: Record<string, unknown> };
+  }
+): Promise<{ text: string }> {
+  const cfg = resolveLlmConfig(req);
+  let prompt: string;
+  let audio: { base64: string; mimeType: string } | undefined;
+  if (typeof r.contents === "string") {
+    prompt = r.contents;
+  } else {
+    prompt = r.contents.parts.map((p) => p.text ?? "").join("\n");
+    const a = r.contents.parts.find((p) => p.inlineData)?.inlineData;
+    if (a) audio = { base64: a.data, mimeType: a.mimeType };
+  }
+  const text = await generateJson(cfg, {
+    system: r.config.systemInstruction,
+    prompt,
+    schema: r.config.responseSchema,
+    audio,
+  });
+  return { text };
+}
+
+/** Extra fields on fallback responses so the UI can tell "no key configured" from "provider error". */
+function fallbackInfo(error: unknown) {
+  return {
+    fallbackReason: error instanceof LlmNotConfiguredError ? "non-configurato" : "errore",
+    fallbackMessage: describeLlmError(error),
+  };
+}
+
+/** Wraps little-endian 16-bit PCM samples in a RIFF/WAV container. */
+function pcm16ToWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
+  const header = Buffer.alloc(44);
+  const byteRate = sampleRate * channels * 2;
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(channels * 2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
 const TRAINING_MODULE_IDS = ["diaframma", "riscaldamento", "solfeggio", "palestra"];
 
 async function startServer() {
@@ -70,6 +134,32 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json({ limit: "15mb" }));
+
+  // 0. AI provider info and connection test (used by the "Impostazioni Coach AI" panel)
+  app.get("/api/llm/server-config", (_req, res) => {
+    res.json({
+      serverProvider: serverDefaultProvider(),
+      providers: LLM_PROVIDERS,
+      defaultModels: DEFAULT_MODELS,
+      customBaseUrlAllowed: process.env.ALLOW_CUSTOM_LLM_BASE_URL === "true",
+    });
+  });
+
+  app.post("/api/llm/test", async (req, res) => {
+    try {
+      const cfg = resolveLlmConfig(req);
+      const text = await generateJson(cfg, {
+        system: "Rispondi solo con il JSON richiesto.",
+        prompt: 'Conferma il collegamento rispondendo con {"ok": true}.',
+        schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+      });
+      JSON.parse(text);
+      res.json({ ok: true, provider: cfg.provider, model: cfg.model, source: cfg.source });
+    } catch (error) {
+      if (!(error instanceof LlmNotConfiguredError)) logLlmError("/api/llm/test", error);
+      res.status(200).json({ ok: false, error: describeLlmError(error) });
+    }
+  });
 
   // 1. Analyze Vocal Exercise Performance & Telemetry (with optional recorded audio)
   app.post("/api/vocal-coach/analyze", async (req, res) => {
@@ -114,8 +204,7 @@ Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, s
       }
       parts.push({ text: promptText });
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+      const response = await callModel(req, {
         contents: { parts },
         config: {
           systemInstruction:
@@ -123,33 +212,33 @@ Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, s
             MEASUREMENT_RULE,
           responseMimeType: "application/json",
           responseSchema: {
-            type: Type.OBJECT,
+            type: "object",
             properties: {
               valutazioneSintetica: {
-                type: Type.STRING,
+                type: "string",
                 description: "Sintesi chiara della performance in 1-2 frasi.",
               },
               diagnosiIntonazione: {
-                type: Type.STRING,
+                type: "string",
                 description:
                   "Analisi della precisione in centesimi (crescente, calante o centrata) e causa fisiologica probabile.",
               },
               consiglioAnatomico: {
-                type: Type.STRING,
+                type: "string",
                 description:
                   "Indicazione pratica su laringe, velo palatino, lingua o sostegno costo-diaframmatico.",
               },
               esercizioCorrettivo: {
-                type: Type.OBJECT,
+                type: "object",
                 properties: {
-                  titolo: { type: Type.STRING },
-                  istruzioni: { type: Type.STRING },
-                  obiettivo: { type: Type.STRING },
+                  titolo: { type: "string" },
+                  istruzioni: { type: "string" },
+                  obiettivo: { type: "string" },
                 },
                 required: ["titolo", "istruzioni", "obiettivo"],
               },
               messaggioVocale: {
-                type: Type.STRING,
+                type: "string",
                 description:
                   "Breve discorso naturale in prima persona (massimo 45 parole) che il Maestro pronuncia a voce allo studente.",
               },
@@ -175,7 +264,7 @@ Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, s
         ])
       );
     } catch (error: any) {
-      console.error("Error in /api/vocal-coach/analyze:", error);
+      logLlmError("/api/vocal-coach/analyze", error);
       // Static offline fallback (isFallback: true): generic advice, only echoing the client's own measured value
       const dev = req.body?.avgCentsDeviation;
       res.status(200).json({
@@ -200,6 +289,7 @@ Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, s
         messaggioVocale:
           "Il coach AI non è disponibile in questo momento. Un consiglio generale: prima di attaccare la nota più acuta prepara l'appoggio intercostale e lascia la gola libera e rilassata.",
         isFallback: true,
+        ...fallbackInfo(error),
       });
     }
   });
@@ -212,8 +302,7 @@ Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, s
         return res.status(400).json({ error: "Inserisci una domanda valida per il Vocal Coach." });
       }
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+      const response = await callModel(req, {
         contents: `Profilo dello studente:
 - Registro: ${fmtText(voiceType, "non specificato")}
 - Estensione: ${
@@ -231,24 +320,24 @@ Domanda dello studente: "${question.slice(0, 2000)}"`,
             " Se lo studente descrive dolore, raucedine persistente o perdita di voce, consiglia di rivolgersi a un foniatra o otorinolaringoiatra.",
           responseMimeType: "application/json",
           responseSchema: {
-            type: Type.OBJECT,
+            type: "object",
             properties: {
-              titoloRisposta: { type: Type.STRING },
-              spiegazioneFisiologica: { type: Type.STRING },
-              azionePratica: { type: Type.STRING },
+              titoloRisposta: { type: "string" },
+              spiegazioneFisiologica: { type: "string" },
+              azionePratica: { type: "string" },
               routineConsigliata: {
-                type: Type.ARRAY,
+                type: "array",
                 items: {
-                  type: Type.OBJECT,
+                  type: "object",
                   properties: {
-                    passo: { type: Type.STRING },
-                    dettaglio: { type: Type.STRING },
+                    passo: { type: "string" },
+                    dettaglio: { type: "string" },
                   },
                   required: ["passo", "dettaglio"],
                 },
               },
               sintesiVocale: {
-                type: Type.STRING,
+                type: "string",
                 description: "Frase breve (max 40 parole) da leggere ad alta voce allo studente.",
               },
             },
@@ -273,7 +362,7 @@ Domanda dello studente: "${question.slice(0, 2000)}"`,
       if (!Array.isArray(parsed.routineConsigliata)) parsed.routineConsigliata = [];
       res.json(parsed);
     } catch (error: any) {
-      console.error("Error in /api/vocal-coach/ask:", error);
+      logLlmError("/api/vocal-coach/ask", error);
       res.status(200).json({
         titoloRisposta:
           "Coach AI non disponibile — consiglio generale sul passaggio di registro e la libertà laringea",
@@ -301,11 +390,13 @@ Domanda dello studente: "${question.slice(0, 2000)}"`,
         sintesiVocale:
           "Per liberare le note acute non spingere con la gola: alleggerisci il volume, alza il velo palatino e sostieni il suono espandendo le costole inferiori.",
         isFallback: true,
+        ...fallbackInfo(error),
       });
     }
   });
 
-  // 3. Spoken Vocal Coach TTS Endpoint using gemini-3.8-flash-lite-tts
+  // 3. Spoken coach voice. Only Gemini offers TTS among the supported providers: with Claude/OpenAI
+  //    (or no key) the server answers 501 and the browser uses its own speech synthesis.
   app.post("/api/vocal-coach/tts", async (req, res) => {
     try {
       const { text } = req.body;
@@ -313,42 +404,44 @@ Domanda dello studente: "${question.slice(0, 2000)}"`,
         return res.status(400).json({ error: "Testo mancante per la sintesi vocale." });
       }
 
+      const cfg = resolveLlmConfig(req);
+      if (cfg.provider !== "gemini") {
+        return res.status(501).json({ error: "Sintesi vocale AI non disponibile con questo provider: uso la voce del browser." });
+      }
+
+      const ai = new GoogleGenAI({ apiKey: cfg.apiKey });
       const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash-lite-tts",
+        model: process.env.GEMINI_TTS_MODEL || "gemini-3.8-flash-lite-tts",
         contents: [
           {
             role: "user",
-            parts: [
-              {
-                text,
-                speechMetadata: {
-                  style: "Warm, articulate, encouraging Italian vocal coach",
-                },
-              } as any,
-            ],
+            parts: [{ text: text.slice(0, 1000), speechMetadata: { style: "Warm, articulate, encouraging Italian vocal coach" } }],
           },
         ],
         config: {
           responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: "Kore" },
-            },
-          },
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } },
         },
       });
 
-      const base64Audio =
-        response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (!base64Audio) {
+      const inline = response.candidates?.[0]?.content?.parts?.find((p) => p.inlineData)?.inlineData;
+      if (!inline?.data) {
         return res.status(502).json({ error: "Nessun audio generato dal modello TTS." });
       }
 
-      res.json({ audioBase64: base64Audio, mimeType: "audio/wav" });
+      // Gemini TTS returns raw 16-bit PCM (audio/L16;rate=24000), which browsers cannot play:
+      // wrap it in a WAV header.
+      const mime = inline.mimeType || "";
+      if (/wav/i.test(mime)) {
+        return res.json({ audioBase64: inline.data, mimeType: "audio/wav" });
+      }
+      const rate = Number(/rate=(\d+)/i.exec(mime)?.[1]) || 24000;
+      const wav = pcm16ToWav(Buffer.from(inline.data, "base64"), rate, 1);
+      res.json({ audioBase64: wav.toString("base64"), mimeType: "audio/wav" });
     } catch (error: any) {
-      console.error("Error in /api/vocal-coach/tts:", error);
+      if (!(error instanceof LlmNotConfiguredError)) logLlmError("/api/vocal-coach/tts", error);
       res.status(503).json({
-        error: "Servizio TTS temporaneamente non disponibile, utilizzo sintesi vocale locale.",
+        error: "Servizio TTS non disponibile, utilizzo sintesi vocale locale.",
       });
     }
   });
@@ -364,8 +457,7 @@ Domanda dello studente: "${question.slice(0, 2000)}"`,
         voiceType,
       } = req.body;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+      const response = await callModel(req, {
         contents: `Modulo didattico: ${fmtText(moduleType, "lezione di canto")}
 Esercizio eseguito: ${fmtText(exerciseName, "non specificato")}
 Registro allievo: ${fmtText(voiceType, "non specificato")}
@@ -378,13 +470,13 @@ Dettagli tecnici: ${typeof details === "string" && details ? details.slice(0, 15
             " Se il risultato non è stato misurato, non lodare né criticare l'esecuzione: dai indicazioni su come eseguire bene l'esercizio.",
           responseMimeType: "application/json",
           responseSchema: {
-            type: Type.OBJECT,
+            type: "object",
             properties: {
-              feedbackMaestro: { type: Type.STRING },
-              correzioneTecnica: { type: Type.STRING },
-              prossimoPasso: { type: Type.STRING },
+              feedbackMaestro: { type: "string" },
+              correzioneTecnica: { type: "string" },
+              prossimoPasso: { type: "string" },
               fraseVocaleCoach: {
-                type: Type.STRING,
+                type: "string",
                 description: "Discorso diretto del Maestro da leggere a voce (max 40 parole).",
               },
             },
@@ -407,7 +499,7 @@ Dettagli tecnici: ${typeof details === "string" && details ? details.slice(0, 15
         ])
       );
     } catch (error: any) {
-      console.error("Error in /api/vocal-coach/lesson-coach:", error);
+      logLlmError("/api/vocal-coach/lesson-coach", error);
       // Static offline fallback, chosen by module so the tip matches the exercise just done
       const mod = String(req.body?.moduleType || "").toLowerCase();
       const intro = "Coach AI non disponibile: ecco un consiglio generale per questo esercizio.";
@@ -437,7 +529,7 @@ Dettagli tecnici: ${typeof details === "string" && details ? details.slice(0, 15
             fraseVocaleCoach:
               "Il coach AI non è disponibile. Ricorda di pensare la nota prima di emetterla: respira sul levare e attacca in modo pulito sul battere.",
           };
-      res.status(200).json({ feedbackMaestro: intro, ...fallback, isFallback: true });
+      res.status(200).json({ feedbackMaestro: intro, ...fallback, isFallback: true, ...fallbackInfo(error) });
     }
   });
 
@@ -498,8 +590,7 @@ Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli so
       }
       parts.push({ text: promptText });
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+      const response = await callModel(req, {
         contents: { parts },
         config: {
           systemInstruction:
@@ -507,29 +598,29 @@ Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli so
             MEASUREMENT_RULE,
           responseMimeType: "application/json",
           responseSchema: {
-            type: Type.OBJECT,
+            type: "object",
             properties: {
-              sintesiPerformance: { type: Type.STRING },
+              sintesiPerformance: { type: "string" },
               puntiDiForza: {
-                type: Type.ARRAY,
+                type: "array",
                 items: {
-                  type: Type.OBJECT,
+                  type: "object",
                   properties: {
-                    titolo: { type: Type.STRING },
-                    dettaglio: { type: Type.STRING },
+                    titolo: { type: "string" },
+                    dettaglio: { type: "string" },
                   },
                   required: ["titolo", "dettaglio"],
                 },
               },
               puntiDeboliDaAllenare: {
-                type: Type.ARRAY,
+                type: "array",
                 items: {
-                  type: Type.OBJECT,
+                  type: "object",
                   properties: {
-                    problema: { type: Type.STRING },
-                    causaFisiologica: { type: Type.STRING },
-                    esercizioConsigliato: { type: Type.STRING },
-                    moduloApp: { type: Type.STRING, enum: TRAINING_MODULE_IDS },
+                    problema: { type: "string" },
+                    causaFisiologica: { type: "string" },
+                    esercizioConsigliato: { type: "string" },
+                    moduloApp: { type: "string", enum: TRAINING_MODULE_IDS },
                   },
                   required: [
                     "problema",
@@ -540,13 +631,13 @@ Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli so
                 },
               },
               presetCorrezioneAi: {
-                type: Type.OBJECT,
+                type: "object",
                 properties: {
-                  pitchCorrectionPercent: { type: Type.NUMBER },
-                  eqPresenceDb: { type: Type.NUMBER },
-                  compressionRatio: { type: Type.NUMBER },
-                  reverbWetPercent: { type: Type.NUMBER },
-                  motivazioneSoundEngineer: { type: Type.STRING },
+                  pitchCorrectionPercent: { type: "number" },
+                  eqPresenceDb: { type: "number" },
+                  compressionRatio: { type: "number" },
+                  reverbWetPercent: { type: "number" },
+                  motivazioneSoundEngineer: { type: "string" },
                 },
                 required: [
                   "pitchCorrectionPercent",
@@ -556,7 +647,7 @@ Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli so
                   "motivazioneSoundEngineer",
                 ],
               },
-              messaggioVocaleCoach: { type: Type.STRING },
+              messaggioVocaleCoach: { type: "string" },
             },
             required: [
               "sintesiPerformance",
@@ -584,7 +675,7 @@ Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli so
       );
       res.json(parsed);
     } catch (error: any) {
-      console.error("Error in /api/vocal-coach/song-analyze:", error);
+      logLlmError("/api/vocal-coach/song-analyze", error);
       res.status(200).json({
         sintesiPerformance:
           "Coach AI non disponibile: nessuna analisi della tua esecuzione è stata generata. Usa le misure mostrate sopra e i consigli generali qui sotto.",
@@ -617,6 +708,7 @@ Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli so
         messaggioVocaleCoach:
           "Il coach AI non è disponibile in questo momento. Puoi comunque riascoltare il tuo take, regolare la correzione e allenarti con i moduli consigliati.",
         isFallback: true,
+        ...fallbackInfo(error),
       });
     }
   });
