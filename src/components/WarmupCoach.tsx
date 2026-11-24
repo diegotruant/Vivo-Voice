@@ -24,6 +24,71 @@ import {
 } from "../utils/audioEngine";
 import { VoiceRegisterId } from "../types/vocal";
 
+// ---------------------------------------------------------------------------
+// Per-device microphone calibration for the anti-strain volume guard.
+// The user's comfortable "ah" becomes 0 dB; the strain threshold is a dB margin above it,
+// so the guard no longer depends on the microphone's gain.
+// ---------------------------------------------------------------------------
+interface MicCalibration {
+  deviceLabel: string;
+  /** Median smoothed RMS of the comfortable "ah" (linear, 0..1). */
+  refRms: number;
+  /** Median RMS of the room while silent (linear, 0..1). */
+  noiseFloor: number;
+  /** ISO date of the calibration. */
+  date: string;
+}
+
+const MIC_CALIBRATION_KEY = "voceviva.mic-calibration.v1";
+const MARGIN_KEY = "voceviva.warmup-margin-db.v1";
+const DEFAULT_MARGIN_DB = 8;
+const MIN_MARGIN_DB = 3;
+const MAX_MARGIN_DB = 15;
+const CALIB_SILENCE_SEC = 1;
+const CALIB_VOICE_SEC = 3;
+const METER_MIN_DB = -30;
+const METER_MAX_DB = 20;
+
+function loadCalibrations(): Record<string, MicCalibration> {
+  try {
+    const raw = localStorage.getItem(MIC_CALIBRATION_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveCalibration(deviceKey: string, cal: MicCalibration): void {
+  try {
+    const all = loadCalibrations();
+    all[deviceKey] = cal;
+    localStorage.setItem(MIC_CALIBRATION_KEY, JSON.stringify(all));
+  } catch {
+    /* storage unavailable: calibration stays for this session only */
+  }
+}
+
+function loadMarginDb(): number {
+  const v = Number(localStorage.getItem(MARGIN_KEY));
+  return Number.isFinite(v) && v >= MIN_MARGIN_DB && v <= MAX_MARGIN_DB ? v : DEFAULT_MARGIN_DB;
+}
+
+/** Identifies the microphone in use (deviceId when exposed, else its label). */
+function deviceKeyFor(stream: MediaStream): { key: string; label: string } {
+  const track = stream.getAudioTracks()[0];
+  const settings = track?.getSettings?.() ?? {};
+  const label = track?.label || "Microfono predefinito";
+  return { key: settings.deviceId || label || "default", label };
+}
+
+const median = (values: number[]): number => {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+};
+
+const toDb = (ratio: number) => 20 * Math.log10(Math.max(ratio, 1e-6));
+
 interface WarmupStage {
   id: string;
   stepIndex: number;
@@ -33,7 +98,10 @@ interface WarmupStage {
   subtitle: string;
   recommendedSec: number;
   restSec: number;
+  /** Uncalibrated fallback threshold on the legacy 0–100 meter scale. */
   maxSafeRmsPercent: number;
+  /** Added to the user's margin when calibrated: fry stages must stay quieter than lip trills. */
+  marginOffsetDb: number;
   physiologicalBenefit: string;
   stepByStepInstruction: string;
   antiStrainWarning: string;
@@ -51,12 +119,13 @@ const WARMUP_STAGES: WarmupStage[] = [
     recommendedSec: 45,
     restSec: 15,
     maxSafeRmsPercent: 45,
+    marginOffsetDb: -6,
     physiologicalBenefit:
       "Il Vocal Fry fa vibrare il bordo libero delle corde vocali a bassa frequenza (35–55 Hz) con flusso d'aria minimo, eliminando la rigidità mattutina senza alcuno scontro meccanico.",
     stepByStepInstruction:
       "Lascia cadere la mandibola rilassata. Emetti un crepitio lento e leggerissimo ('Uhhh...' come una porta che cigola piano). Se il suono si interrompe, aggiungi un filo impercettibile di fiato; non spingere mai con la gola.",
     antiStrainWarning:
-      "Regola Anti-Sforzo: Il Vocal Fry deve essere appena udibile (sotto il 45% di volume). Non grattare mai la gola cercando volume!",
+      "Regola Anti-Sforzo: Il Vocal Fry deve essere appena udibile, ben sotto il tuo volume comodo. Non grattare mai la gola cercando volume!",
     coachSpeech:
       "Iniziamo il riscaldamento con 45 secondi di Vocal Fry leggerissimo. Lascia la mandibola morbida e produci un lento crepitio a volume bassissimo, come una porta che cigola. Serve a massaggiare la mucosa delle corde vocali senza alcuno sforzo.",
   },
@@ -70,6 +139,7 @@ const WARMUP_STAGES: WarmupStage[] = [
     recommendedSec: 45,
     restSec: 15,
     maxSafeRmsPercent: 55,
+    marginOffsetDb: -3,
     physiologicalBenefit:
       "Partire dal Vocal Fry per entrare nella nota cantata garantisce che le corde vocali siano già accostate dolcemente prima che arrivi la pressione del fiato.",
     stepByStepInstruction:
@@ -89,6 +159,7 @@ const WARMUP_STAGES: WarmupStage[] = [
     recommendedSec: 60,
     restSec: 15,
     maxSafeRmsPercent: 65,
+    marginOffsetDb: 0,
     physiologicalBenefit:
       "La vibrazione delle labbra crea una contropressione d'aria (impedenza retrograda) che scende verso la laringe, tenendo le corde vocali su un cuscinetto d'aria che impedisce di sforzare.",
     stepByStepInstruction:
@@ -108,6 +179,7 @@ const WARMUP_STAGES: WarmupStage[] = [
     recommendedSec: 60,
     restSec: 10,
     maxSafeRmsPercent: 65,
+    marginOffsetDb: 0,
     physiologicalBenefit:
       "Permette ai muscoli cricotiroidei di allungare gradualmente le corde vocali verso gli acuti senza che la laringe salga o si chiuda.",
     stepByStepInstruction:
@@ -157,6 +229,16 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
   // Measured vocal-fry pulse rate (median of recent detections), null until measured
   const [fryHz, setFryHz] = useState<number | null>(null);
   const [isOverpushing, setIsOverpushing] = useState<boolean>(false);
+  // Level relative to the calibrated comfortable volume (dB), null when not calibrated
+  const [liveRelDb, setLiveRelDb] = useState<number | null>(null);
+
+  // Per-device calibration
+  const [deviceKey, setDeviceKey] = useState<string | null>(null);
+  const [deviceLabel, setDeviceLabel] = useState<string>("");
+  const [calibration, setCalibration] = useState<MicCalibration | null>(null);
+  const [marginDb, setMarginDb] = useState<number>(() => loadMarginDb());
+  const [calibPhase, setCalibPhase] = useState<"idle" | "silence" | "voice">("idle");
+  const [calibMessage, setCalibMessage] = useState<string | null>(null);
 
   // AI Coach Warmup Evaluation
   const [isEvaluating, setIsEvaluating] = useState<boolean>(false);
@@ -177,6 +259,38 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
   const measuringRef = useRef<boolean>(false);
   // Measured phonation per stage: seconds with voice and seconds above the safe volume
   const stageStatsRef = useRef<Record<string, { voicedSec: number; overSec: number }>>({});
+  // Read inside the rAF loop without rebuilding it
+  const calibrationRef = useRef<MicCalibration | null>(null);
+  const marginDbRef = useRef<number>(marginDb);
+  // Whether the stats collected so far used a calibrated threshold (reported to the coach)
+  const usedCalibratedRef = useRef<boolean | null>(null);
+  const calibRunRef = useRef<{
+    phase: "silence" | "voice";
+    startT: number | null;
+    silence: number[];
+    voice: number[];
+  } | null>(null);
+  const startCalibrationAfterMicRef = useRef<boolean>(false);
+  const devKeyRef = useRef<string | null>(null);
+  const devLabelRef = useRef<string>("");
+
+  useEffect(() => {
+    calibrationRef.current = calibration;
+  }, [calibration]);
+
+  useEffect(() => {
+    devKeyRef.current = deviceKey;
+    devLabelRef.current = deviceLabel;
+  }, [deviceKey, deviceLabel]);
+
+  useEffect(() => {
+    marginDbRef.current = marginDb;
+    try {
+      localStorage.setItem(MARGIN_KEY, String(marginDb));
+    } catch {
+      /* ignore */
+    }
+  }, [marginDb]);
 
   useEffect(() => {
     measuringRef.current = isRunning && !isResting;
@@ -216,6 +330,10 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
       setLiveFreqHz(null);
       setFryHz(null);
       setIsOverpushing(false);
+      setLiveRelDb(null);
+      calibRunRef.current = null;
+      startCalibrationAfterMicRef.current = false;
+      setCalibPhase("idle");
       return;
     }
 
@@ -234,6 +352,17 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
         return;
       }
       streamRef.current = stream;
+      // Each microphone has its own gain: use (or ask for) the calibration of this device
+      const dev = deviceKeyFor(stream);
+      setDeviceKey(dev.key);
+      setDeviceLabel(dev.label);
+      setCalibration(loadCalibrations()[dev.key] ?? null);
+      stream.getAudioTracks()[0]?.addEventListener("ended", () => {
+        if (!mountedRef.current) return;
+        releaseMic();
+        setMicActive(false);
+        setMicError("Il microfono è stato scollegato: riattivalo (verrà usata la sua calibrazione).");
+      });
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const ctx = new AudioCtx();
       audioCtxRef.current = ctx;
@@ -244,9 +373,14 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
       src.connect(analyser);
       analyserRef.current = analyser;
       setMicActive(true);
+      if (startCalibrationAfterMicRef.current) {
+        startCalibrationAfterMicRef.current = false;
+        beginCalibration();
+      }
     } catch (err) {
       releaseMic();
       setMicActive(false);
+      startCalibrationAfterMicRef.current = false;
       const name = (err as { name?: string })?.name;
       setMicError(
         name === "NotAllowedError"
@@ -268,6 +402,28 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
     };
   }, []);
 
+  // Calibration: 1 s of silence (room noise) then ~3 s of a comfortable "ah"
+  const beginCalibration = () => {
+    calibRunRef.current = { phase: "silence", startT: null, silence: [], voice: [] };
+    setCalibMessage(null);
+    setCalibPhase("silence");
+  };
+
+  const handleCalibrate = () => {
+    if (calibPhase !== "idle") return;
+    if (micActive) {
+      beginCalibration();
+    } else {
+      startCalibrationAfterMicRef.current = true;
+      void toggleMicMonitor();
+    }
+  };
+
+  const cancelCalibration = () => {
+    calibRunRef.current = null;
+    setCalibPhase("idle");
+  };
+
   // Poll Microphone RMS & Frequency to protect against vocal strain
   useEffect(() => {
     if (!micActive) return;
@@ -278,9 +434,10 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
     const fryReadings: Array<{ t: number; hz: number }> = [];
     let frame = 0;
     setFryHz(null);
-    let smoothed = 0;
+    let smoothedRms = 0;
     let lastT = performance.now();
-    // Below this (smoothed) level the frame is treated as silence / room noise
+    let lastUiT = 0;
+    // Uncalibrated: below this level (legacy 0–100 meter scale) the frame is silence / room noise
     const VOICED_THRESHOLD = 6;
 
     const monitorLoop = (now: number) => {
@@ -291,19 +448,87 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
           sum += buf[i] * buf[i];
         }
         const rms = Math.sqrt(sum / buf.length);
-        const volPct = Math.min(100, rms * 380);
         // ~300 ms exponential smoothing so single plosives don't trip the strain alarm
         const dt = Math.min(0.2, Math.max(0, (now - lastT) / 1000));
         lastT = now;
-        smoothed += (volPct - smoothed) * (1 - Math.exp(-dt / 0.3));
-        const over = smoothed > activeStage.maxSafeRmsPercent;
-        setLiveVolumePercent(Math.round(smoothed));
-        setIsOverpushing(over);
+        smoothedRms += (rms - smoothedRms) * (1 - Math.exp(-dt / 0.3));
+        const smoothed = Math.min(100, smoothedRms * 380); // legacy uncalibrated meter (0–100)
 
-        if (measuringRef.current && smoothed > VOICED_THRESHOLD) {
+        // --- calibration run ---
+        const run = calibRunRef.current;
+        if (run) {
+          if (run.startT === null) run.startT = now;
+          const elapsed = (now - run.startT) / 1000;
+          if (run.phase === "silence") {
+            // skip the first 0.2 s (button click / onset), then collect room noise
+            if (elapsed > 0.2) run.silence.push(rms);
+            if (elapsed >= CALIB_SILENCE_SEC) {
+              run.phase = "voice";
+              run.startT = now;
+              setCalibPhase("voice");
+            }
+          } else {
+            const floor = run.silence.length > 0 ? median(run.silence) : 0;
+            // voiced = at least +10 dB above the room
+            if (smoothedRms > Math.max(floor * 3.16, 1e-4) && elapsed > 0.3) run.voice.push(smoothedRms);
+            if (elapsed >= CALIB_VOICE_SEC) {
+              calibRunRef.current = null;
+              setCalibPhase("idle");
+              const voicedSec = run.voice.length * dt;
+              if (run.voice.length < 20 || voicedSec < 1) {
+                setCalibMessage(
+                  "Voce non rilevata abbastanza a lungo: riprova tenendo una \"ah\" comoda per 3 secondi."
+                );
+              } else if (devKeyRef.current) {
+                const cal: MicCalibration = {
+                  deviceLabel: devLabelRef.current,
+                  refRms: median(run.voice),
+                  noiseFloor: floor,
+                  date: new Date().toISOString(),
+                };
+                saveCalibration(devKeyRef.current, cal);
+                calibrationRef.current = cal;
+                setCalibration(cal);
+                const snr = toDb(cal.refRms / Math.max(cal.noiseFloor, 1e-6));
+                setCalibMessage(
+                  snr < 15
+                    ? `Calibrazione salvata, ma la stanza è rumorosa (voce solo ${Math.round(snr)} dB sopra il rumore): il controllo sarà meno preciso.`
+                    : "Calibrazione salvata per questo microfono."
+                );
+              }
+            }
+          }
+        }
+
+        // --- strain guard ---
+        const cal = calibrationRef.current;
+        let over: boolean;
+        let voiced: boolean;
+        let relDb: number | null = null;
+        if (cal) {
+          relDb = toDb(smoothedRms / cal.refRms);
+          over = relDb > marginDbRef.current + activeStage.marginOffsetDb;
+          // voiced = +10 dB above the calibrated room noise and not far below the comfortable level
+          voiced = smoothedRms > Math.max(cal.noiseFloor * 3.16, cal.refRms * 0.03);
+        } else {
+          over = smoothed > activeStage.maxSafeRmsPercent;
+          voiced = smoothed > VOICED_THRESHOLD;
+        }
+
+        // UI at ~20 Hz
+        if (now - lastUiT > 50) {
+          lastUiT = now;
+          setLiveVolumePercent(Math.round(smoothed));
+          setLiveRelDb(relDb === null ? null : Math.round(relDb * 10) / 10);
+          setIsOverpushing(over && voiced);
+        }
+
+        if (measuringRef.current && !run && voiced) {
           const st = (stageStatsRef.current[activeStage.id] ??= { voicedSec: 0, overSec: 0 });
           st.voicedSec += dt;
           if (over) st.overSec += dt;
+          // a stats set mixing calibrated and uncalibrated frames is reported as not calibrated
+          usedCalibratedRef.current = (usedCalibratedRef.current ?? true) && !!cal;
         }
 
         const pitchRes = detectPitchAutocorrelation(
@@ -332,7 +557,13 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
 
     rafId = requestAnimationFrame(monitorLoop);
     return () => cancelAnimationFrame(rafId);
-  }, [micActive, activeStage.id, activeStage.techniqueType, activeStage.maxSafeRmsPercent]);
+  }, [
+    micActive,
+    activeStage.id,
+    activeStage.techniqueType,
+    activeStage.maxSafeRmsPercent,
+    activeStage.marginOffsetDb,
+  ]);
 
   // Countdown Timer with Automatic Anti-Strain Rest Period between stages
   useEffect(() => {
@@ -378,6 +609,17 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [remainingSec, isRunning, isResting]);
 
+  // Meter geometry: calibrated → dB scale (METER_MIN_DB..METER_MAX_DB), else legacy 0–100 %
+  const stageThresholdDb = marginDb + activeStage.marginOffsetDb;
+  const meterFraction =
+    calibration && liveRelDb !== null
+      ? (Math.max(METER_MIN_DB, Math.min(METER_MAX_DB, liveRelDb)) - METER_MIN_DB) /
+        (METER_MAX_DB - METER_MIN_DB)
+      : liveVolumePercent / 100;
+  const thresholdFraction = calibration
+    ? (stageThresholdDb - METER_MIN_DB) / (METER_MAX_DB - METER_MIN_DB)
+    : activeStage.maxSafeRmsPercent / 100;
+
   // Play Synthesized Audio Demonstration for the current Warmup Stage
   const handlePlayStageDemo = () => {
     if (activeStage.techniqueType === "vocal-fry") {
@@ -408,8 +650,11 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
           )}s oltre il volume sicuro`
       )
       .join("; ");
+    const thresholdNote = usedCalibratedRef.current
+      ? `Soglia anti-sforzo calibrata su questo microfono: volume sicuro = fino a ${marginDb} dB sopra il volume comodo dell'allievo (meno nelle fasi di Vocal Fry).`
+      : "Soglia anti-sforzo NON calibrata per questo microfono: stima euristica, dipende dal guadagno del microfono e va considerata indicativa.";
     const details = measured
-      ? `Fasi completate: ${completedStageIds.length}/${WARMUP_STAGES.length}. Tempo di timer esercizio: ${totalWarmupSecondsLogged}s. Fonazione misurata col microfono: ${Math.round(totalVoiced)}s, di cui entro il volume sicuro ${safePercent}%. Dettaglio: ${perStage}.`
+      ? `Fasi completate: ${completedStageIds.length}/${WARMUP_STAGES.length}. Tempo di timer esercizio: ${totalWarmupSecondsLogged}s. Fonazione misurata col microfono: ${Math.round(totalVoiced)}s, di cui entro il volume sicuro ${safePercent}%. ${thresholdNote} Dettaglio: ${perStage}.`
       : `Fasi completate: ${completedStageIds.length}/${WARMUP_STAGES.length}. Tempo di timer esercizio: ${totalWarmupSecondsLogged}s. ${
           micActive
             ? "Microfono attivo ma nessuna fonazione rilevata durante il timer: volume non misurato."
@@ -774,8 +1019,18 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
                   Sensore Microfonico Anti-Sforzo (Controllo Pressione e Volume)
                 </div>
                 <p className="text-[11px] text-slate-400">
-                  Verifica che il tuo Vocal Fry o Lip Trill rimanga leggero (sotto il{" "}
-                  {activeStage.maxSafeRmsPercent}% di spinta).
+                  {calibration ? (
+                    <>
+                      Verifica che il tuo Vocal Fry o Lip Trill resti leggero: al massimo{" "}
+                      {stageThresholdDb >= 0 ? "+" : ""}
+                      {stageThresholdDb} dB rispetto al tuo volume comodo.
+                    </>
+                  ) : (
+                    <>
+                      Verifica che il tuo Vocal Fry o Lip Trill rimanga leggero (sotto il{" "}
+                      {activeStage.maxSafeRmsPercent}% sulla scala non calibrata).
+                    </>
+                  )}
                 </p>
               </div>
 
@@ -807,12 +1062,96 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
 
             {micError && <p className="text-[11px] text-rose-400">{micError}</p>}
 
+            {/* Per-device calibration */}
+            <div className="flex flex-col gap-2 rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[11px] leading-snug">
+                  {calibration ? (
+                    <span className="text-emerald-300">
+                      ● Soglia calibrata per {deviceLabel || "questo microfono"} (
+                      {new Date(calibration.date).toLocaleDateString("it-IT")})
+                    </span>
+                  ) : micActive ? (
+                    <span className="text-amber-300">
+                      ▲ Soglia non calibrata per questo microfono: calibra per un controllo affidabile
+                    </span>
+                  ) : (
+                    <span className="text-slate-400">
+                      Calibra il microfono per tarare la soglia anti-sforzo sul tuo volume comodo.
+                    </span>
+                  )}
+                </div>
+                {calibPhase === "idle" ? (
+                  <button
+                    type="button"
+                    onClick={handleCalibrate}
+                    className="rounded-lg border border-slate-600 px-3 py-1.5 text-[11px] font-semibold text-slate-200 hover:bg-slate-800 whitespace-nowrap"
+                  >
+                    {calibration ? "Ricalibra microfono" : "Calibra microfono"}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={cancelCalibration}
+                    className="rounded-lg border border-slate-600 px-3 py-1.5 text-[11px] font-semibold text-slate-300 hover:bg-slate-800 whitespace-nowrap"
+                  >
+                    Annulla
+                  </button>
+                )}
+              </div>
+              {calibPhase === "silence" && (
+                <p className="text-xs font-semibold text-sky-300">
+                  1/2 · Stai in silenzio per 1 secondo (misuro il rumore della stanza)…
+                </p>
+              )}
+              {calibPhase === "voice" && (
+                <p className="text-xs font-semibold text-sky-300">
+                  2/2 · Canta una &ldquo;ah&rdquo; comoda a metà estensione, al tuo volume normale, per 3 secondi…
+                </p>
+              )}
+              {calibMessage && calibPhase === "idle" && (
+                <p className="text-[11px] text-slate-300">{calibMessage}</p>
+              )}
+              <label className="flex flex-col gap-1 text-[11px] text-slate-400">
+                <span className="flex justify-between">
+                  <span>Margine sopra il volume comodo (dB)</span>
+                  <span className="font-mono text-slate-200">+{marginDb} dB</span>
+                </span>
+                <input
+                  type="range"
+                  min={MIN_MARGIN_DB}
+                  max={MAX_MARGIN_DB}
+                  step={1}
+                  value={marginDb}
+                  onChange={(e) => setMarginDb(Number(e.target.value))}
+                  disabled={!calibration}
+                  className="accent-sky-500 disabled:opacity-40"
+                />
+                <span className="text-[10px] text-slate-500">
+                  {calibration
+                    ? `Nelle fasi di Vocal Fry la soglia è più bassa (${activeStage.marginOffsetDb} dB rispetto al margine).`
+                    : "Disponibile dopo la calibrazione."}
+                </span>
+              </label>
+            </div>
+
             {micActive && (
               <div className="flex flex-col gap-1.5 font-mono text-xs">
-                <div className="flex justify-between">
+                <div className="flex justify-between gap-2">
                   <span className="text-slate-400">
-                    Intensità Emissione: {liveVolumePercent}% (Limite consigliato:{" "}
-                    {activeStage.maxSafeRmsPercent}%)
+                    {calibration && liveRelDb !== null ? (
+                      <>
+                        Livello: {liveRelDb >= 0 ? "+" : ""}
+                        {liveRelDb.toFixed(1)} dB rispetto al volume comodo (soglia{" "}
+                        {stageThresholdDb >= 0 ? "+" : ""}
+                        {stageThresholdDb} dB)
+                      </>
+                    ) : (
+                      <>
+                        Intensità Emissione: {liveVolumePercent}% (Limite non calibrato:{" "}
+                        {activeStage.maxSafeRmsPercent}%)
+                      </>
+                    )}
                   </span>
                   <span
                     className={
@@ -832,10 +1171,23 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
                       isOverpushing ? "bg-rose-500" : "bg-emerald-400"
                     }`}
                     style={{
-                      transform: `scaleX(${Math.max(0.02, liveVolumePercent / 100)})`,
+                      transform: `scaleX(${Math.max(0.02, meterFraction)})`,
                     }}
                   />
+                  {/* threshold marker */}
+                  <div
+                    className="absolute top-0 bottom-0 w-0.5 bg-amber-300/80"
+                    style={{ left: `${Math.min(100, thresholdFraction * 100)}%` }}
+                    aria-hidden="true"
+                  />
                 </div>
+                {calibration && (
+                  <div className="flex justify-between text-[10px] text-slate-500">
+                    <span>{METER_MIN_DB} dB</span>
+                    <span>0 dB = volume comodo</span>
+                    <span>+{METER_MAX_DB} dB</span>
+                  </div>
+                )}
               </div>
             )}
           </div>
