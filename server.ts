@@ -14,7 +14,16 @@ import {
   LlmNotConfiguredError,
   DEFAULT_MODELS,
   LLM_PROVIDERS,
+  LlmUserFacingError,
+  type LlmConfig,
 } from "./llm";
+import {
+  createRateLimitStore,
+  perIpLimiter,
+  consumeServerKeyBudget,
+  ServerKeyBudgetExceededError,
+  type RateLimitStore,
+} from "./rateLimit";
 
 dotenv.config();
 
@@ -85,7 +94,7 @@ async function callModel(
     config: { systemInstruction: string; responseMimeType?: string; responseSchema: Record<string, unknown> };
   }
 ): Promise<{ text: string }> {
-  const cfg = resolveLlmConfig(req);
+  const cfg = await resolveConfigWithBudget(req);
   let prompt: string;
   let audio: { base64: string; mimeType: string } | undefined;
   if (typeof r.contents === "string") {
@@ -157,39 +166,24 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
-/**
- * Minimal in-memory per-IP fixed-window rate limiter for the AI endpoints
- * (protects the provider key and the user's credit from abuse). Single-process only.
- */
-function createRateLimiter(maxRequests: number, windowMs: number) {
-  const hits = new Map<string, { count: number; resetAt: number }>();
-  const sweep = setInterval(() => {
-    const now = Date.now();
-    for (const [ip, h] of hits) if (h.resetAt <= now) hits.delete(ip);
-  }, windowMs);
-  sweep.unref();
+/** Rate-limit counters (memory, or Redis when REDIS_URL is set); created at startup. */
+let rateLimitStore: RateLimitStore;
 
-  return (req: Request, res: Response, next: NextFunction) => {
-    if (req.method !== "POST") return next();
-    const ip = req.ip || req.socket.remoteAddress || "sconosciuto";
-    const now = Date.now();
-    let h = hits.get(ip);
-    if (!h || h.resetAt <= now) {
-      h = { count: 0, resetAt: now + windowMs };
-      hits.set(ip, h);
+/**
+ * Resolves the provider for this request; requests that would use the SERVER key also
+ * consume its daily budget (SERVER_KEY_DAILY_LIMIT). User keys are not counted.
+ */
+async function resolveConfigWithBudget(req: Request): Promise<LlmConfig> {
+  const cfg = resolveLlmConfig(req);
+  if (cfg.source === "server") {
+    try {
+      await consumeServerKeyBudget(rateLimitStore, envInt("SERVER_KEY_DAILY_LIMIT", 0));
+    } catch (e) {
+      if (e instanceof ServerKeyBudgetExceededError) throw new LlmUserFacingError(e.message);
+      throw e;
     }
-    h.count += 1;
-    res.setHeader("RateLimit-Limit", String(maxRequests));
-    res.setHeader("RateLimit-Remaining", String(Math.max(0, maxRequests - h.count)));
-    if (h.count > maxRequests) {
-      const retryAfterSec = Math.ceil((h.resetAt - now) / 1000);
-      res.setHeader("Retry-After", String(retryAfterSec));
-      return res.status(429).json({
-        error: `Troppe richieste al Coach AI. Riprova tra ${retryAfterSec} secondi.`,
-      });
-    }
-    next();
-  };
+  }
+  return cfg;
 }
 
 async function startServer() {
@@ -210,7 +204,10 @@ async function startServer() {
     next();
   });
 
-  const aiLimiter = createRateLimiter(
+  rateLimitStore = await createRateLimitStore();
+  console.log(`Limite richieste AI: archivio in ${rateLimitStore.kind}.`);
+  const aiLimiter = perIpLimiter(
+    rateLimitStore,
     envInt("AI_RATE_LIMIT_MAX", 30),
     envInt("AI_RATE_LIMIT_WINDOW_SEC", 300) * 1000
   );
@@ -232,7 +229,7 @@ async function startServer() {
 
   app.post("/api/llm/test", async (req, res) => {
     try {
-      const cfg = resolveLlmConfig(req);
+      const cfg = await resolveConfigWithBudget(req);
       const text = await generateJson(cfg, {
         system: "Rispondi solo con il JSON richiesto.",
         prompt: 'Conferma il collegamento rispondendo con {"ok": true}.',
@@ -483,7 +480,7 @@ Domanda dello studente: "${question.slice(0, 2000)}"`,
         return res.status(400).json({ error: "Testo mancante per la sintesi vocale." });
       }
 
-      const cfg = resolveLlmConfig(req);
+      const cfg = await resolveConfigWithBudget(req);
       if (cfg.provider !== "gemini") {
         return res.status(501).json({ error: "Sintesi vocale AI non disponibile con questo provider: uso la voce del browser." });
       }

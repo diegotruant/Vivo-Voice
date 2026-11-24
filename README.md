@@ -70,7 +70,9 @@ Variabili d'ambiente del server (vedi `.env.example`):
 |---|---|---|
 | `PORT` / `HOST` | `3000` / `0.0.0.0` | Porta e indirizzo di ascolto |
 | `TRUST_PROXY` | — | Dietro un reverse proxy (Render, Fly, nginx…) impostalo, es. `1`, così il limite per IP usa l'IP reale del client |
-| `AI_RATE_LIMIT_MAX` / `AI_RATE_LIMIT_WINDOW_SEC` | `30` / `300` | Richieste AI consentite per IP nella finestra (limite in memoria, per singolo processo) |
+| `AI_RATE_LIMIT_MAX` / `AI_RATE_LIMIT_WINDOW_SEC` | `30` / `300` | Richieste AI consentite per IP nella finestra |
+| `REDIS_URL` | — | Se impostato (es. `redis://host:6379`), i contatori dei limiti sono condivisi tra più istanze del server. Senza, restano in memoria (corretto con un solo processo). Se Redis non risponde, i limiti vengono sospesi e l'app continua a funzionare |
+| `SERVER_KEY_DAILY_LIMIT` | `0` (nessun tetto) | Tetto giornaliero (UTC) di richieste fatte con la chiave AI **del server**, per contenere i costi. Le richieste con la chiave dell'utente non vengono contate. Oltre il tetto il coach risponde con il consiglio offline e invita l'utente a inserire la propria chiave |
 | `JSON_BODY_LIMIT` | `10mb` | Dimensione massima delle richieste (le registrazioni audio viaggiano in base64) |
 | `LLM_PROVIDER`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `LLM_MODEL`, `LLM_EFFORT` | — | Chiave AI del server, facoltativa (vedi sopra) |
 | `ALLOW_CUSTOM_LLM_BASE_URL` | `false` | Solo per installazioni private: consente URL personalizzati compatibili OpenAI |
