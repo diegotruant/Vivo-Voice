@@ -1,4 +1,5 @@
 import express from "express";
+import type { NextFunction, Response } from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
@@ -16,6 +17,10 @@ import {
 } from "./llm";
 
 dotenv.config();
+
+// `--production` (used by `npm start`) is the cross-platform way to select production mode.
+if (process.argv.includes("--production")) process.env.NODE_ENV = "production";
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -129,11 +134,91 @@ function pcm16ToWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
 
 const TRAINING_MODULE_IDS = ["diaframma", "riscaldamento", "solfeggio", "palestra"];
 
+const ALLOWED_AUDIO_MIME = new Set([
+  "audio/webm",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/ogg",
+  "audio/mpeg",
+  "audio/mp4",
+]);
+
+/** Returns the recorded audio only when it has an allowed MIME type and looks like base64; otherwise ignores it. */
+function safeAudio(base64: unknown, mime: unknown): { data: string; mimeType: string } | null {
+  if (typeof base64 !== "string" || typeof mime !== "string" || base64.length === 0) return null;
+  const baseType = mime.split(";")[0].trim().toLowerCase();
+  if (!ALLOWED_AUDIO_MIME.has(baseType)) return null;
+  if (!/^[A-Za-z0-9+/=\s]+$/.test(base64.slice(0, 2000))) return null;
+  return { data: base64, mimeType: baseType };
+}
+
+function envInt(name: string, fallback: number): number {
+  const v = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
+/**
+ * Minimal in-memory per-IP fixed-window rate limiter for the AI endpoints
+ * (protects the provider key and the user's credit from abuse). Single-process only.
+ */
+function createRateLimiter(maxRequests: number, windowMs: number) {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  const sweep = setInterval(() => {
+    const now = Date.now();
+    for (const [ip, h] of hits) if (h.resetAt <= now) hits.delete(ip);
+  }, windowMs);
+  sweep.unref();
+
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (req.method !== "POST") return next();
+    const ip = req.ip || req.socket.remoteAddress || "sconosciuto";
+    const now = Date.now();
+    let h = hits.get(ip);
+    if (!h || h.resetAt <= now) {
+      h = { count: 0, resetAt: now + windowMs };
+      hits.set(ip, h);
+    }
+    h.count += 1;
+    res.setHeader("RateLimit-Limit", String(maxRequests));
+    res.setHeader("RateLimit-Remaining", String(Math.max(0, maxRequests - h.count)));
+    if (h.count > maxRequests) {
+      const retryAfterSec = Math.ceil((h.resetAt - now) / 1000);
+      res.setHeader("Retry-After", String(retryAfterSec));
+      return res.status(429).json({
+        error: `Troppe richieste al Coach AI. Riprova tra ${retryAfterSec} secondi.`,
+      });
+    }
+    next();
+  };
+}
+
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = envInt("PORT", 3000);
+  const HOST = process.env.HOST || "0.0.0.0";
 
-  app.use(express.json({ limit: "15mb" }));
+  app.disable("x-powered-by");
+  // Behind a reverse proxy (Render, Fly, nginx…) set TRUST_PROXY (e.g. "1") so req.ip is the client IP.
+  if (process.env.TRUST_PROXY) {
+    const tp = process.env.TRUST_PROXY;
+    app.set("trust proxy", /^\d+$/.test(tp) ? Number(tp) : tp === "true" ? true : tp);
+  }
+
+  app.use((_req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    next();
+  });
+
+  const aiLimiter = createRateLimiter(
+    envInt("AI_RATE_LIMIT_MAX", 30),
+    envInt("AI_RATE_LIMIT_WINDOW_SEC", 300) * 1000
+  );
+  app.use("/api/vocal-coach", aiLimiter);
+  app.use("/api/llm", aiLimiter);
+
+  // Recorded audio travels as base64 (~+33%): 10 MB covers a few minutes of compressed audio.
+  app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "10mb" }));
 
   // 0. AI provider info and connection test (used by the "Impostazioni Coach AI" panel)
   app.get("/api/llm/server-config", (_req, res) => {
@@ -194,14 +279,8 @@ Analizza la seguente sessione di allenamento vocale eseguita dallo studente:
 Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, strutturata esattamente secondo lo schema JSON richiesto.`;
 
       const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
-      if (audioBase64 && audioMimeType) {
-        parts.push({
-          inlineData: {
-            mimeType: audioMimeType,
-            data: audioBase64,
-          },
-        });
-      }
+      const audio = safeAudio(audioBase64, audioMimeType);
+      if (audio) parts.push({ inlineData: audio });
       parts.push({ text: promptText });
 
       const response = await callModel(req, {
@@ -580,14 +659,8 @@ Per ogni punto debole, "moduloApp" deve essere uno di: diaframma, riscaldamento,
 Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli solo se supportati dai dati.`;
 
       const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
-      if (audioBase64 && audioMimeType) {
-        parts.push({
-          inlineData: {
-            mimeType: audioMimeType,
-            data: audioBase64,
-          },
-        });
-      }
+      const audio = safeAudio(audioBase64, audioMimeType);
+      if (audio) parts.push({ inlineData: audio });
       parts.push({ text: promptText });
 
       const response = await callModel(req, {
@@ -713,7 +786,21 @@ Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli so
     }
   });
 
-  if (process.env.NODE_ENV !== "production") {
+  // JSON errors for malformed/oversized bodies (express would otherwise answer with an HTML page).
+  app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) return next(err);
+    if (err?.type === "entity.too.large") {
+      return res.status(413).json({ error: "Richiesta troppo grande (registrazione audio troppo lunga)." });
+    }
+    if (err?.type === "entity.parse.failed") {
+      return res.status(400).json({ error: "Richiesta non valida (JSON malformato)." });
+    }
+    // Log only method/path and the error message: never headers (they may carry X-LLM-Api-Key).
+    console.error(`[${req.method} ${req.path}] ${err?.name ?? "Error"}: ${String(err?.message ?? err).slice(0, 300)}`);
+    res.status(err?.status && err.status < 500 ? err.status : 500).json({ error: "Errore interno del server." });
+  });
+
+  if (!IS_PRODUCTION) {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -722,15 +809,29 @@ Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli so
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, "dist");
-    app.use(express.static(distPath));
+    app.use(express.static(distPath, { index: false, maxAge: "1h" }));
+    app.use("/api", (_req, res) => res.status(404).json({ error: "Endpoint non trovato." }));
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`VoceViva Server listening on http://localhost:${PORT}`);
+  const server = app.listen(PORT, HOST, () => {
+    console.log(
+      `VoceViva Server (${IS_PRODUCTION ? "produzione" : "sviluppo"}) in ascolto su http://${HOST === "0.0.0.0" ? "localhost" : HOST}:${PORT}`
+    );
+  });
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    console.error(
+      err.code === "EADDRINUSE"
+        ? `La porta ${PORT} è già in uso: imposta un'altra porta con la variabile PORT.`
+        : `Errore del server HTTP: ${err.message}`
+    );
+    process.exit(1);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error("Avvio del server VoceViva non riuscito:", err);
+  process.exit(1);
+});

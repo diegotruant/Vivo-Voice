@@ -134,7 +134,21 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
 
   const micStreamRef = useRef<MediaStream | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const recordedChunksRef = useRef<Float32Array[]>([]);
+  // Each captured block with the AudioContext time of its first sample (see startRecordingOverSong)
+  const recordedChunksRef = useRef<Array<{ t0: number; data: Float32Array }>>([]);
+  // AudioContext time at which the backing stems started during the current recording
+  const recordStartAtRef = useRef<number>(0);
+  const recordMaxDurRef = useRef<number>(16);
+  // Latency compensation (s) used for the current take, read by finalizeTake (avoids stale state)
+  const recordCompSecRef = useRef<number>(0);
+  const isFinishingRef = useRef<boolean>(false);
+  const isMountedRef = useRef<boolean>(true);
+  // Untrimmed last take, kept so the user can re-align it with a different latency value
+  const untrimmedTakeRef = useRef<{ data: Float32Array; firstT0: number; startAt: number; sampleRate: number } | null>(null);
+  const [studioError, setStudioError] = useState<string | null>(null);
+  // Round-trip latency compensation: null = automatic estimate from the audio device
+  const [latencyCompMs, setLatencyCompMs] = useState<number | null>(null);
+  const [estimatedLatencyMs, setEstimatedLatencyMs] = useState<number | null>(null);
   const telemetryPointsRef = useRef<PitchTelemetryPoint[]>([]);
   const weakPassagesRef = useRef<WeakPassageRecord[]>([]);
   const rafRef = useRef<number | null>(null);
@@ -170,9 +184,15 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
         setTrackDurationSec(harmonyBuf.duration);
       })
       .catch((e) => console.error("Failed to render built-in backing stems:", e));
+    isMountedRef.current = true;
     return () => {
       cancelled = true;
+      isMountedRef.current = false;
       stopAllAudio();
+      // Release the audio device: browsers cap the number of live AudioContexts
+      const ctx = audioCtxRef.current;
+      audioCtxRef.current = null;
+      if (ctx && ctx.state !== "closed") ctx.close().catch(() => undefined);
     };
   }, []);
 
@@ -370,9 +390,11 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     e: React.ChangeEvent<HTMLInputElement>,
     target: "main" | "stem"
   ) => {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
     if (!file) return;
     stopAllAudio();
+    setStudioError(null);
 
     try {
       const arrayBuf = await file.arrayBuffer();
@@ -389,6 +411,12 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
       }
     } catch (err) {
       console.error("Errore decodifica file audio:", err);
+      setStudioError(
+        `Impossibile leggere "${file.name}": il formato non è supportato dal browser o il file è danneggiato. Prova con un MP3 o WAV.`
+      );
+    } finally {
+      // Allow selecting the same file again
+      input.value = "";
     }
   };
 
@@ -451,9 +479,40 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     }
   };
 
+  /**
+   * Round-trip latency estimate (seconds): what the singer hears is delayed by the output
+   * latency, and their voice reaches us delayed by the input latency. A vocal sung in time
+   * with backing time T is therefore captured at context time ≈ T + this value.
+   */
+  const estimateRoundTripLatencySec = (ctx: AudioContext, stream: MediaStream): number => {
+    const base = ctx.baseLatency || 0;
+    const output = (ctx as AudioContext & { outputLatency?: number }).outputLatency || 0;
+    const trackSettings = stream.getAudioTracks()[0]?.getSettings() as MediaTrackSettings & { latency?: number };
+    const input = typeof trackSettings?.latency === "number" ? trackSettings.latency : 0;
+    return base + output + input;
+  };
+
+  const compensationSec = (estimateSec: number) =>
+    latencyCompMs !== null ? latencyCompMs / 1000 : estimateSec;
+
+  /** Builds the vocal buffer aligned to the backing: drops what was captured before the song start + latency. */
+  const buildAlignedVocal = (
+    ctx: BaseAudioContext,
+    take: { data: Float32Array; firstT0: number; startAt: number; sampleRate: number },
+    compSec: number
+  ): AudioBuffer => {
+    const offset = Math.max(0, Math.round((take.startAt + compSec - take.firstT0) * take.sampleRate));
+    const len = Math.max(1, take.data.length - offset);
+    const buf = ctx.createBuffer(1, len, take.sampleRate);
+    buf.getChannelData(0).set(take.data.subarray(Math.min(offset, take.data.length - 1)));
+    return buf;
+  };
+
   // Start Synchronized Vocal Recording Over Backing Track
   const startRecordingOverSong = async () => {
     stopAllAudio();
+    setStudioError(null);
+    isFinishingRef.current = false;
     try {
       const ctx = getAudioCtx();
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -463,15 +522,40 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
           autoGainControl: false,
         },
       });
+      if (!isMountedRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       micStreamRef.current = stream;
 
       recordedChunksRef.current = [];
       telemetryPointsRef.current = [];
       weakPassagesRef.current = [];
+      untrimmedTakeRef.current = null;
       setWeakPassages([]);
       setCorrectedVocalBuffer(null);
 
-      // Start playing backing stems so singer hears the music while recording
+      const estimateSec = estimateRoundTripLatencySec(ctx, stream);
+      setEstimatedLatencyMs(Math.round(estimateSec * 1000));
+      const compSec = compensationSec(estimateSec);
+      recordCompSecRef.current = compSec;
+
+      // Build the capture graph FIRST, then start every backing stem at one shared, slightly
+      // future context time, so capture and playback share the same clock origin.
+      const BUFFER_SIZE = 2048;
+      const micSource = ctx.createMediaStreamSource(stream);
+      const processor = ctx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+      scriptProcessorRef.current = processor;
+      const silentGain = ctx.createGain();
+      silentGain.gain.value = 0;
+      micSource.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(ctx.destination);
+
+      const startAt = ctx.currentTime + 0.2;
+      recordStartAtRef.current = startAt;
+      startTimeRef.current = startAt;
+
       const sources: AudioBufferSourceNode[] = [];
       if (backingBuffer) {
         const src = ctx.createBufferSource();
@@ -480,7 +564,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
         g.gain.value = muteBacking ? 0 : backingGain;
         backingGainNodeRef.current = g;
         src.connect(g).connect(ctx.destination);
-        src.start();
+        src.start(startAt);
         sources.push(src);
       }
       if (extraStemBuffer) {
@@ -490,30 +574,22 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
         g2.gain.value = muteExtraStem ? 0 : extraStemGain;
         extraStemGainNodeRef.current = g2;
         src2.connect(g2).connect(ctx.destination);
-        src2.start();
+        src2.start(startAt);
         sources.push(src2);
       }
       activeSourcesRef.current = sources;
-
-      // Capture microphone samples and compute real-time pitch telemetry
-      const micSource = ctx.createMediaStreamSource(stream);
-      const processor = ctx.createScriptProcessor(2048, 1, 1);
-      scriptProcessorRef.current = processor;
-
-      const silentGain = ctx.createGain();
-      silentGain.gain.value = 0;
-      micSource.connect(processor);
-      processor.connect(silentGain);
-      silentGain.connect(ctx.destination);
-
-      startTimeRef.current = ctx.currentTime;
       setIsRecording(true);
 
       processor.onaudioprocess = (ev) => {
         const input = ev.inputBuffer.getChannelData(0);
-        recordedChunksRef.current.push(new Float32Array(input));
+        // A ScriptProcessor hands us input one block behind its output time: the first sample
+        // of this block was captured at ≈ playbackTime − blockDuration.
+        const t0 = ev.playbackTime - BUFFER_SIZE / ctx.sampleRate;
+        recordedChunksRef.current.push({ t0, data: new Float32Array(input) });
 
-        const elapsed = ctx.currentTime - startTimeRef.current;
+        // Song time this block corresponds to, after latency compensation
+        const elapsed = t0 - startAt - compSec;
+        if (elapsed < 0) return;
         const pitch = detectPitchAutocorrelation(input, ctx.sampleRate);
         if (pitch && pitch.freq && pitch.rms > 0.012) {
           const midiFloat = freqToMidiFloat(pitch.freq);
@@ -558,12 +634,17 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
         }
       };
 
-      const maxDur = backingBuffer ? backingBuffer.duration : 16;
+      // Record for the longest loaded stem (plus the compensation tail so the last sung notes are kept)
+      const stemDurations = [backingBuffer?.duration, extraStemBuffer?.duration].filter(
+        (d): d is number => typeof d === "number"
+      );
+      const maxDur = stemDurations.length > 0 ? Math.max(...stemDurations) : 16;
+      recordMaxDurRef.current = maxDur;
       const tick = () => {
-        const elapsed = ctx.currentTime - startTimeRef.current;
-        setPlayheadSec(Math.min(maxDur, elapsed));
-        if (elapsed >= maxDur) {
-          finishRecordingVocal();
+        const elapsed = ctx.currentTime - startAt;
+        setPlayheadSec(Math.max(0, Math.min(maxDur, elapsed)));
+        if (elapsed >= maxDur + compSec) {
+          void finishRecordingVocal();
           return;
         }
         rafRef.current = requestAnimationFrame(tick);
@@ -572,25 +653,51 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     } catch (err) {
       console.error("Impossibile avviare la registrazione microfono:", err);
       stopAllAudio();
+      const name = (err as DOMException)?.name;
+      setStudioError(
+        name === "NotAllowedError"
+          ? "Accesso al microfono negato: consentilo nelle impostazioni del browser per registrare."
+          : name === "NotFoundError"
+          ? "Nessun microfono trovato: collega un microfono e riprova."
+          : "Impossibile avviare la registrazione dal microfono."
+      );
     }
   };
 
   // Finalize Recorded Vocal Take & Run AI Diagnosis + Mastering
   const finishRecordingVocal = async () => {
+    // Can be reached from both the stop button and the end-of-song rAF tick: run once
+    if (isFinishingRef.current) return;
+    isFinishingRef.current = true;
+    try {
+      await finalizeTake();
+    } catch (err) {
+      console.error("Errore durante la finalizzazione della registrazione:", err);
+      if (isMountedRef.current) {
+        setStudioError("Si è verificato un errore durante l'elaborazione del take. Riprova la registrazione.");
+        setIsAnalyzingAi(false);
+        setIsProcessingAudioAi(false);
+      }
+    }
+  };
+
+  const finalizeTake = async () => {
     const ctx = getAudioCtx();
     const chunks = recordedChunksRef.current;
     stopAllAudio();
 
     if (chunks.length === 0) return;
 
-    const totalLen = chunks.reduce((acc, c) => acc + c.length, 0);
-    const vocalBuf = ctx.createBuffer(1, totalLen, ctx.sampleRate);
-    const channel = vocalBuf.getChannelData(0);
+    const totalLen = chunks.reduce((acc, c) => acc + c.data.length, 0);
+    const data = new Float32Array(totalLen);
     let offset = 0;
     for (const c of chunks) {
-      channel.set(c, offset);
-      offset += c.length;
+      data.set(c.data, offset);
+      offset += c.data.length;
     }
+    const take = { data, firstT0: chunks[0].t0, startAt: recordStartAtRef.current, sampleRate: ctx.sampleRate };
+    untrimmedTakeRef.current = take;
+    const vocalBuf = buildAlignedVocal(ctx, take, recordCompSecRef.current);
 
     setRawVocalBuffer(vocalBuf);
 
@@ -680,6 +787,18 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     } finally {
       setIsProcessingAudioAi(false);
     }
+  };
+
+  // Re-align the last take with the current latency compensation (no need to sing again)
+  const handleRealignLastTake = async () => {
+    const take = untrimmedTakeRef.current;
+    if (!take) return;
+    stopAllAudio();
+    const ctx = getAudioCtx();
+    const estSec = (estimatedLatencyMs ?? 0) / 1000;
+    const vocalBuf = buildAlignedVocal(ctx, take, compensationSec(estSec));
+    setRawVocalBuffer(vocalBuf);
+    await masterVocalWithCurrentSettings(vocalBuf);
   };
 
   // Synthesize a realistic Test Vocal Take (with slight pitch flaws) so users can test AI Diagnosis + AI Correction + Stem Mixing anytime
@@ -874,17 +993,28 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     rafRef.current = requestAnimationFrame(updatePlayhead);
   };
 
-  // Export Isolated AI-Corrected Vocal Track (.WAV)
-  const handleDownloadVocalWav = () => {
-    const targetBuf = correctedVocalBuffer || rawVocalBuffer;
-    if (!targetBuf) return;
-    const blob = encodeAudioBufferToWav(targetBuf);
+  // Attached to the DOM and revoked later: some browsers (Safari, older Firefox) cancel the
+  // download if the anchor is detached or the URL is revoked synchronously.
+  const triggerDownload = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${songName.replace(/\s+/g, "_")}_Voce_Corretta_AI.wav`;
+    a.download = filename;
+    a.style.display = "none";
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const exportingAiVocal = useAiCorrectedVocal && !!correctedVocalBuffer;
+
+  // Export the isolated vocal track (.WAV): AI-corrected or raw, as selected by the user
+  const handleDownloadVocalWav = () => {
+    const targetBuf = exportingAiVocal ? correctedVocalBuffer : rawVocalBuffer;
+    if (!targetBuf) return;
+    const suffix = exportingAiVocal ? "Voce_Corretta_AI" : "Voce_Raw";
+    triggerDownload(encodeAudioBufferToWav(targetBuf), `${songName.replace(/\s+/g, "_")}_${suffix}.wav`);
   };
 
   // Render & Export Complete Mixed Master Song (AI Vocal + Instrumental Stems) as 16-bit Stereo .WAV
@@ -932,13 +1062,10 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     }
 
     const renderedMaster = await offline.startRendering();
-    const blob = encodeAudioBufferToWav(renderedMaster);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${songName.replace(/\s+/g, "_")}_Brano_Master_Mix_AI.wav`;
-    a.click();
-    URL.revokeObjectURL(url);
+    triggerDownload(
+      encodeAudioBufferToWav(renderedMaster),
+      `${songName.replace(/\s+/g, "_")}_Brano_Master_Mix${activeVocal === correctedVocalBuffer && correctedVocalBuffer ? "_AI" : ""}.wav`
+    );
   };
 
   return (
@@ -1015,6 +1142,59 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
                 </span>
               </div>
             </div>
+          </div>
+
+          {studioError && (
+            <div className="flex items-start justify-between gap-3 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+              <span>{studioError}</span>
+              <button type="button" onClick={() => setStudioError(null)} className="shrink-0 text-rose-200 hover:text-white" aria-label="Chiudi messaggio">
+                ✕
+              </button>
+            </div>
+          )}
+
+          {/* Latency compensation: aligns the recorded voice with the backing */}
+          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-slate-800 bg-slate-950/50 px-3 py-2 text-[11px] text-slate-400">
+            <label htmlFor="latency-comp" className="font-mono">
+              Compensazione latenza:{" "}
+              <strong className="text-slate-200">
+                {latencyCompMs !== null
+                  ? `${latencyCompMs} ms (manuale)`
+                  : estimatedLatencyMs !== null
+                  ? `${estimatedLatencyMs} ms (automatica)`
+                  : "automatica"}
+              </strong>
+            </label>
+            <input
+              id="latency-comp"
+              type="range"
+              min={0}
+              max={500}
+              step={5}
+              value={latencyCompMs ?? estimatedLatencyMs ?? 0}
+              onChange={(e) => setLatencyCompMs(Number(e.target.value))}
+              disabled={isRecording}
+              className="w-40 accent-sky-500"
+            />
+            {latencyCompMs !== null && (
+              <button type="button" onClick={() => setLatencyCompMs(null)} disabled={isRecording} className="text-sky-400 hover:text-sky-300">
+                Auto
+              </button>
+            )}
+            {untrimmedTakeRef.current && !isRecording && (
+              <button
+                type="button"
+                onClick={handleRealignLastTake}
+                disabled={isProcessingAudioAi}
+                className="rounded border border-slate-700 px-2 py-0.5 text-slate-300 hover:bg-slate-800 disabled:opacity-40"
+              >
+                Riallinea l'ultimo take
+              </button>
+            )}
+            <span className="basis-full text-slate-500">
+              Se la voce suona in ritardo o in anticipo rispetto alla base, regola il valore e premi
+              &ldquo;Riallinea&rdquo;. Con le cuffie la stima automatica è di solito corretta.
+            </span>
           </div>
 
           {/* Primary Transport & Recording Controls */}
@@ -1355,7 +1535,9 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
               className="flex items-center justify-center gap-2 w-full py-2 px-3 rounded-lg text-xs font-medium bg-slate-950 hover:bg-slate-800 disabled:opacity-40 text-slate-200 border border-slate-800 transition-colors"
             >
               <Download className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Esporta Solo Stem Voce Corretta AI (.WAV)</span>
+              <span>
+                {exportingAiVocal ? "Esporta Solo Stem Voce Corretta AI (.WAV)" : "Esporta Solo Stem Voce Raw (.WAV)"}
+              </span>
             </button>
           </div>
         </div>

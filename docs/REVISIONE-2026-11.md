@@ -54,4 +54,10 @@ l'ambito accademico (es. VoiceWorm, Università di Bologna).
   manca la misura; cronologia progressi vuota all'inizio; simulatore mai salvato come reale; vibrato della Palestra
   misurato davvero; modelli simulati dichiarati; avviso visibile quando il coach AI risponde con un testo di riserva;
   contratto client/server dello Studio Brani allineato; contatore cicli della Respirazione corretto.
-- Fase 2 (bug bloccanti), Fase 3 (misure reali), Fase 4 (produzione e sicurezza): da fare.
+- **Coach AI multi-provider: completato.** L'utente sceglie Claude (consigliato), Gemini o OpenAI e inserisce la propria chiave.
+- **Fase 2 — bug, misure, produzione e sicurezza: completata.** Compensazione latenza nello Studio Brani; rilevatore di
+  intonazione normalizzato (errore ≤0,2 cent da 65 a 1046 Hz su toni sintetici); vocal fry misurato nel riscaldamento;
+  sintetizzatore formanti e "stop" corretti; Palestra aggiornata a ~15 Hz invece di 60; voce del coach senza
+  interruzioni; avvio di produzione, porta configurabile, limite richieste AI per IP, errori JSON, header di sicurezza.
+- Ancora aperti: soglia di volume del riscaldamento non calibrata per dispositivo; limite richieste solo in memoria
+  (non condiviso tra più istanze); correzione d'intonazione AI ancora semplice (granulare, semitono più vicino).

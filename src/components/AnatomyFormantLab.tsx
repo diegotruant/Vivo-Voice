@@ -329,14 +329,18 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
         const nyquist = ctx.sampleRate / 2;
         const binCount = freqData.length;
 
+        // Each plotted point covers a frequency span: take the max over all bins in it,
+        // so narrow harmonic peaks are never skipped.
+        const step = 2;
+        const hzToBin = (hz: number) =>
+          Math.min(binCount - 1, Math.max(0, Math.floor((hz / nyquist) * binCount)));
         const pts: string[] = [];
-        for (let x = 0; x <= width; x += 6) {
-          const hz = (x / width) * maxHz;
-          const bin = Math.min(
-            binCount - 1,
-            Math.max(0, Math.round((hz / nyquist) * binCount))
-          );
-          const norm = freqData[bin] / 255;
+        for (let x = 0; x <= width; x += step) {
+          const loBin = hzToBin(((x - step / 2) / width) * maxHz);
+          const hiBin = Math.max(loBin, hzToBin(((x + step / 2) / width) * maxHz));
+          let peak = 0;
+          for (let b = loBin; b <= hiBin; b++) peak = Math.max(peak, freqData[b]);
+          const norm = peak / 255;
           const y = height - 22 - norm * (height - 42);
           pts.push(`${x === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`);
         }

@@ -235,14 +235,37 @@ export function formatMidiNote(midi: number): {
   };
 }
 
+export interface PitchDetectOptions {
+  /** Lowest detectable frequency in Hz (default 65 Hz, C2). Use ~30 Hz for vocal fry. */
+  minFreq?: number;
+  /** Highest detectable frequency in Hz (default 1150 Hz). */
+  maxFreq?: number;
+  /** Minimum periodicity (0–1) to accept a pitch (default 0.45). */
+  clarityThreshold?: number;
+}
+
 /**
- * Autocorrelation pitch detector with parabolic interpolation for sub-cent precision.
- * Returns null if signal RMS is below noise floor or periodicity is weak.
+ * Pitch detector based on the McLeod Normalized Square Difference Function (NSDF):
+ * an autocorrelation normalized for the shrinking overlap at each lag, so clarity stays
+ * near 1 for clean periodic tones at any pitch, with parabolic interpolation for
+ * sub-cent precision.
+ *
+ * The buffer must contain at least 2 periods of the lowest frequency of interest:
+ * length >= 2 * sampleRate / minFreq (e.g. 2048 samples cover 65 Hz at 48 kHz;
+ * vocal fry at 30 Hz needs 4096 samples at 48 kHz). Lower frequencies than the buffer
+ * allows are simply not detected.
+ *
+ * Returns null if the signal RMS is below the noise floor or periodicity is weak.
  */
 export function detectPitchAutocorrelation(
   buffer: Float32Array,
-  sampleRate: number
+  sampleRate: number,
+  options: PitchDetectOptions = {}
 ): { freq: number; rms: number; clarity: number } | null {
+  const minFreq = options.minFreq ?? 65;
+  const maxFreq = options.maxFreq ?? 1150;
+  const clarityThreshold = options.clarityThreshold ?? 0.45;
+
   const size = buffer.length;
   let sumSquares = 0;
   for (let i = 0; i < size; i++) {
@@ -254,82 +277,66 @@ export function detectPitchAutocorrelation(
   if (rms < 0.012) {
     return null;
   }
+  if (size < 64) return null;
 
-  // Trim edges to improve autocorrelation window
-  let r1 = 0;
-  let r2 = size - 1;
-  const threshold = 0.2;
-  for (let i = 0; i < size / 2; i++) {
-    if (Math.abs(buffer[i]) < threshold) {
-      r1 = i;
-      break;
+  const minLag = Math.max(2, Math.floor(sampleRate / maxFreq));
+  // At least two periods must fit in the buffer
+  const maxLag = Math.min(Math.floor(size / 2), Math.ceil(sampleRate / minFreq));
+  if (maxLag <= minLag + 2) return null;
+
+  // NSDF: n(τ) = 2·Σ x[j]x[j+τ] / Σ (x[j]² + x[j+τ]²), j over the overlap
+  const nsdf = new Float32Array(maxLag + 2);
+  for (let lag = 0; lag <= maxLag + 1; lag++) {
+    let acf = 0;
+    let energy = 0;
+    const end = size - lag;
+    for (let j = 0; j < end; j++) {
+      const a = buffer[j];
+      const b = buffer[j + lag];
+      acf += a * b;
+      energy += a * a + b * b;
     }
+    nsdf[lag] = energy > 0 ? (2 * acf) / energy : 0;
   }
-  for (let i = 1; i < size / 2; i++) {
-    if (Math.abs(buffer[size - i]) < threshold) {
-      r2 = size - i;
-      break;
+
+  // Key maxima: highest point between each positive-going and negative-going zero crossing
+  const peaks: number[] = [];
+  let lag = 1;
+  while (lag <= maxLag && nsdf[lag] > 0) lag++; // skip the zero-lag lobe
+  while (lag <= maxLag) {
+    while (lag <= maxLag && nsdf[lag] <= 0) lag++;
+    let best = -1;
+    while (lag <= maxLag && nsdf[lag] > 0) {
+      if (lag >= minLag && (best === -1 || nsdf[lag] > nsdf[best])) best = lag;
+      lag++;
     }
+    if (best !== -1) peaks.push(best);
   }
+  if (peaks.length === 0) return null;
 
-  const trimmed = buffer.slice(r1, r2);
-  const newSize = trimmed.length;
-  if (newSize < 64) return null;
+  let highest = 0;
+  for (const p of peaks) highest = Math.max(highest, nsdf[p]);
+  // First key maximum close to the highest one: avoids picking a multiple of the period (octave error)
+  const maxPos = peaks.find((p) => nsdf[p] >= 0.9 * highest) ?? peaks[0];
 
-  // Compute autocorrelation only within vocal frequency bounds (65 Hz C2 to 1100 Hz C6)
-  const minLag = Math.max(8, Math.floor(sampleRate / 1150));
-  const maxLag = Math.min(Math.floor(newSize * 0.8), Math.ceil(sampleRate / 65));
-
-  const c = new Float32Array(maxLag + 2);
-  for (let lag = minLag; lag <= maxLag + 1; lag++) {
-    let sum = 0;
-    for (let j = 0; j < newSize - lag; j++) {
-      sum += trimmed[j] * trimmed[j + lag];
-    }
-    c[lag] = sum;
-  }
-
-  // Zero-lag energy for clarity normalization
-  let c0 = 0;
-  for (let j = 0; j < newSize; j++) {
-    c0 += trimmed[j] * trimmed[j];
-  }
-  if (c0 === 0) return null;
-
-  // Find first dip then highest peak
-  let d = minLag;
-  while (d < maxLag && c[d] > c[d + 1]) {
-    d++;
-  }
-
-  let maxVal = -1;
-  let maxPos = -1;
-  for (let i = d; i <= maxLag; i++) {
-    if (c[i] > maxVal) {
-      maxVal = c[i];
-      maxPos = i;
-    }
-  }
-
-  if (maxPos === -1) return null;
-  const clarity = maxVal / c0;
-  if (clarity < 0.45) return null;
-
-  // Parabolic interpolation around peak
+  // Parabolic interpolation around the peak
   let T0 = maxPos;
-  if (maxPos > minLag && maxPos < maxLag) {
-    const x1 = c[maxPos - 1];
-    const x2 = c[maxPos];
-    const x3 = c[maxPos + 1];
+  let clarity = nsdf[maxPos];
+  if (maxPos > 0 && maxPos < maxLag + 1) {
+    const x1 = nsdf[maxPos - 1];
+    const x2 = nsdf[maxPos];
+    const x3 = nsdf[maxPos + 1];
     const a = (x1 + x3 - 2 * x2) / 2;
     const b = (x3 - x1) / 2;
     if (a < 0) {
       T0 = maxPos - b / (2 * a);
+      clarity = Math.min(1, x2 - (b * b) / (4 * a));
     }
   }
 
+  if (clarity < clarityThreshold) return null;
   const freq = sampleRate / T0;
-  if (freq < 65 || freq > 1150) return null;
+  if (freq < minFreq || freq > maxFreq) return null;
 
   return { freq, rms, clarity };
 }
@@ -342,6 +349,13 @@ class StudioAudioSynthesizer {
   private ctx: AudioContext | null = null;
   private activeSustainOscs: OscillatorNode[] = [];
   private activeSustainGain: GainNode | null = null;
+  /** Every oscillator this synthesizer has started and that has not ended yet (for stopAll). */
+  private liveOscs = new Set<OscillatorNode>();
+
+  private trackOsc(osc: OscillatorNode): void {
+    this.liveOscs.add(osc);
+    osc.addEventListener("ended", () => this.liveOscs.delete(osc));
+  }
 
   public getContext(): AudioContext {
     if (!this.ctx || this.ctx.state === "closed") {
@@ -382,6 +396,7 @@ class StudioAudioSynthesizer {
 
     partials.forEach((p) => {
       const osc = ctx.createOscillator();
+      this.trackOsc(osc);
       const pGain = ctx.createGain();
       osc.type = p.type;
       osc.frequency.setValueAtTime(freq * p.ratio, now);
@@ -403,6 +418,7 @@ class StudioAudioSynthesizer {
     const ctx = this.getContext();
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
+    this.trackOsc(osc);
     const gain = ctx.createGain();
     osc.type = "sine";
     osc.frequency.setValueAtTime(isDownbeat ? 1100 : 780, now);
@@ -431,10 +447,13 @@ class StudioAudioSynthesizer {
 
     // Glottal source (sawtooth with natural 5.5Hz vibrato)
     const sourceOsc = ctx.createOscillator();
+    this.trackOsc(sourceOsc);
     sourceOsc.type = "sawtooth";
     sourceOsc.frequency.setValueAtTime(fundamental, now);
 
     const vibratoOsc = ctx.createOscillator();
+
+    this.trackOsc(vibratoOsc);
     const vibratoGain = ctx.createGain();
     vibratoOsc.frequency.setValueAtTime(5.4, now);
     vibratoGain.gain.setValueAtTime(fundamental * 0.012, now);
@@ -484,6 +503,8 @@ class StudioAudioSynthesizer {
     const durationSec = transitionToNote ? 2.6 : 2.0;
 
     const osc = ctx.createOscillator();
+
+    this.trackOsc(osc);
     osc.type = "sawtooth";
 
     if (transitionToNote) {
@@ -535,6 +556,8 @@ class StudioAudioSynthesizer {
     const peakFreq = midiToFreq(rootMidi + intervalSemitones);
 
     const voiceOsc = ctx.createOscillator();
+
+    this.trackOsc(voiceOsc);
     voiceOsc.type = "triangle";
     voiceOsc.frequency.setValueAtTime(startFreq, now);
     voiceOsc.frequency.exponentialRampToValueAtTime(
@@ -548,6 +571,7 @@ class StudioAudioSynthesizer {
 
     // 25 Hz lip-flutter modulator (simulating relaxed vibrating lips)
     const flutterOsc = ctx.createOscillator();
+    this.trackOsc(flutterOsc);
     flutterOsc.type = "sine";
     flutterOsc.frequency.setValueAtTime(25, now);
 
@@ -603,10 +627,14 @@ class StudioAudioSynthesizer {
     const fundamental = midiToFreq(midi);
 
     const sourceOsc = ctx.createOscillator();
+
+    this.trackOsc(sourceOsc);
     sourceOsc.type = "sawtooth";
     sourceOsc.frequency.setValueAtTime(fundamental, now);
 
     const vibratoOsc = ctx.createOscillator();
+
+    this.trackOsc(vibratoOsc);
     const vibratoGain = ctx.createGain();
     vibratoOsc.frequency.setValueAtTime(5.3, now);
     vibratoGain.gain.setValueAtTime(fundamental * 0.011, now);
@@ -669,39 +697,51 @@ class StudioAudioSynthesizer {
   }
 
   public stopLiveFormant(): void {
-    if (this.liveFormantGain && this.ctx) {
+    // Capture the current nodes: a new live formant may be started before the timeout fires
+    // and must not be stopped by it.
+    const source = this.liveFormantSource;
+    const vibrato = this.liveFormantVibrato;
+    const gain = this.liveFormantGain;
+    this.liveFormantSource = null;
+    this.liveFormantVibrato = null;
+    this.liveFormantFilters = [];
+    this.liveFormantGain = null;
+    if (!source && !vibrato && !gain) return;
+
+    if (gain && this.ctx) {
       try {
-        this.liveFormantGain.gain.setTargetAtTime(
-          0.0001,
-          this.ctx.currentTime,
-          0.03
-        );
+        gain.gain.setTargetAtTime(0.0001, this.ctx.currentTime, 0.03);
       } catch {
         // ignore
       }
     }
     setTimeout(() => {
+      for (const node of [source, vibrato]) {
+        try {
+          node?.stop();
+        } catch {
+          // already stopped
+        }
+      }
       try {
-        this.liveFormantSource?.stop();
-        this.liveFormantVibrato?.stop();
+        gain?.disconnect();
       } catch {
         // ignore
       }
-      this.liveFormantSource = null;
-      this.liveFormantVibrato = null;
-      this.liveFormantFilters = [];
-      this.liveFormantGain = null;
-    }, 50);
+    }, 120);
   }
 
+  /** Stops every sound this synthesizer is playing (notes, demos, sustained tones, live formant). */
   public stopAll(): void {
-    this.activeSustainOscs.forEach((o) => {
+    this.stopLiveFormant();
+    this.liveOscs.forEach((o) => {
       try {
         o.stop();
       } catch {
         // ignore already stopped
       }
     });
+    this.liveOscs.clear();
     this.activeSustainOscs = [];
     if (this.activeSustainGain) {
       try {

@@ -154,6 +154,8 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
   const [micActive, setMicActive] = useState<boolean>(false);
   const [liveVolumePercent, setLiveVolumePercent] = useState<number>(0);
   const [liveFreqHz, setLiveFreqHz] = useState<number | null>(null);
+  // Measured vocal-fry pulse rate (median of recent detections), null until measured
+  const [fryHz, setFryHz] = useState<number | null>(null);
   const [isOverpushing, setIsOverpushing] = useState<boolean>(false);
 
   // AI Coach Warmup Evaluation
@@ -212,6 +214,7 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
       setMicActive(false);
       setLiveVolumePercent(0);
       setLiveFreqHz(null);
+      setFryHz(null);
       setIsOverpushing(false);
       return;
     }
@@ -236,7 +239,8 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
       audioCtxRef.current = ctx;
       const src = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
-      analyser.fftSize = 2048;
+      // 4096 samples cover ≥2 periods down to ~25 Hz, enough to measure vocal fry (35–55 Hz)
+      analyser.fftSize = 4096;
       src.connect(analyser);
       analyserRef.current = analyser;
       setMicActive(true);
@@ -268,7 +272,12 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
   useEffect(() => {
     if (!micActive) return;
     let rafId: number;
-    const buf = new Float32Array(2048);
+    const buf = new Float32Array(4096);
+    const isFryStage =
+      activeStage.techniqueType === "vocal-fry" || activeStage.techniqueType === "fry-onset";
+    const fryReadings: Array<{ t: number; hz: number }> = [];
+    let frame = 0;
+    setFryHz(null);
     let smoothed = 0;
     let lastT = performance.now();
     // Below this (smoothed) level the frame is treated as silence / room noise
@@ -302,13 +311,28 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
           audioCtxRef.current.sampleRate
         );
         setLiveFreqHz(pitchRes ? Math.round(pitchRes.freq) : null);
+
+        // Vocal fry: low, irregular pulses. Searched only in fry stages and every 3rd frame (CPU).
+        if (isFryStage && frame++ % 3 === 0 && smoothed > VOICED_THRESHOLD) {
+          const fry = detectPitchAutocorrelation(buf, audioCtxRef.current.sampleRate, {
+            minFreq: 28,
+            maxFreq: 90,
+            clarityThreshold: 0.35,
+          });
+          if (fry && fry.freq <= 70) fryReadings.push({ t: now, hz: fry.freq });
+          while (fryReadings.length > 0 && now - fryReadings[0].t > 1500) fryReadings.shift();
+          if (fryReadings.length >= 4) {
+            const sorted = fryReadings.map((r) => r.hz).sort((a, b) => a - b);
+            setFryHz(Math.round(sorted[Math.floor(sorted.length / 2)]));
+          }
+        }
       }
       rafId = requestAnimationFrame(monitorLoop);
     };
 
     rafId = requestAnimationFrame(monitorLoop);
     return () => cancelAnimationFrame(rafId);
-  }, [micActive, activeStage.id, activeStage.maxSafeRmsPercent]);
+  }, [micActive, activeStage.id, activeStage.techniqueType, activeStage.maxSafeRmsPercent]);
 
   // Countdown Timer with Automatic Anti-Strain Rest Period between stages
   useEffect(() => {
@@ -570,7 +594,9 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
                       fontSize="10"
                       fontFamily="IBM Plex Mono"
                     >
-                      Impulsi M0 (~42 Hz indicativo · non misurato)
+                      {fryHz !== null
+                        ? `Impulsi M0 misurati: ~${fryHz} Hz`
+                        : "Impulsi M0 (~42 Hz indicativo · non misurato)"}
                     </text>
                   </>
                 ) : (

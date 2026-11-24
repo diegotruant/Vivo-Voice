@@ -151,9 +151,9 @@ const ANTHROPIC_FALLBACK_MODELS = new Set([
 /** Claude 5-generation models accept output_config.effort. */
 const supportsEffort = (model: string) => /^claude-(opus|sonnet|haiku|fable|mythos)-5/.test(model);
 
-const LLM_EFFORT = (["low", "medium", "high", "xhigh", "max"] as const).find(
-  (e) => e === process.env.LLM_EFFORT
-) ?? "low";
+/** Read lazily: this module is imported before dotenv populates process.env. */
+const llmEffort = () =>
+  (["low", "medium", "high", "xhigh", "max"] as const).find((e) => e === process.env.LLM_EFFORT) ?? "low";
 
 /** Returns the model's raw JSON text. Throws on any provider error (→ endpoint fallback). */
 export async function generateJson(cfg: LlmConfig, r: JsonRequest): Promise<string> {
@@ -177,7 +177,7 @@ async function generateWithClaude(cfg: LlmConfig, r: JsonRequest): Promise<strin
     messages: [{ role: "user", content: r.prompt }],
     output_config: {
       format: { type: "json_schema", schema: strictSchema(r.schema) },
-      ...(supportsEffort(cfg.model) ? { effort: LLM_EFFORT } : {}),
+      ...(supportsEffort(cfg.model) ? { effort: llmEffort() } : {}),
     },
     // On a safety decline the API re-runs the request on a fallback model chosen by refusal category.
     ...(useFallbacks

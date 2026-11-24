@@ -144,6 +144,10 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
   // Rolling buffer of live pitch frames (~1.5 s) for vibrato analysis, running or not
   const liveVibratoBufRef = useRef<Array<{ timestamp: number; detectedMidiFloat: number | null }>>([]);
   const frameCounterRef = useRef<number>(0);
+  // Render-loop performance: per-frame values live in refs; React state is pushed at ~15 Hz.
+  const currentStepIndexRef = useRef<number>(0);
+  const lastUiPushMsRef = useRef<number>(0);
+  const requestAiAnalysisRef = useRef<() => void>(() => {});
   const micStartingRef = useRef<boolean>(false);
   const isMountedRef = useRef<boolean>(true);
 
@@ -505,13 +509,24 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
     setAiResult(null);
   };
 
+  useEffect(() => {
+    currentStepIndexRef.current = currentStepIndex;
+  }, [currentStepIndex]);
+
+  useEffect(() => {
+    requestAiAnalysisRef.current = requestAiAnalysis;
+  }, [requestAiAnalysis]);
+
   // Main Animation & Pitch Detection Loop
   useEffect(() => {
     let animationFrameId: number;
     const floatBuffer = new Float32Array(2048);
 
+    const UI_PUSH_INTERVAL_MS = 66; // ~15 Hz for React state; canvas still redraws every frame
     const renderLoop = (nowMs: number) => {
       const beatsPerSec = bpm / 60;
+      const pushUi = nowMs - lastUiPushMsRef.current >= UI_PUSH_INTERVAL_MS;
+      if (pushUi) lastUiPushMsRef.current = nowMs;
       let currentBeat = 0;
       let activeStep = timelineSteps[0];
 
@@ -530,16 +545,19 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
           ) {
             mediaRecorderRef.current.stop();
           } else {
-            requestAiAnalysis();
+            requestAiAnalysisRef.current();
           }
         } else {
-          setElapsedBeats(currentBeat);
+          if (pushUi) setElapsedBeats(currentBeat);
           const foundStep =
             timelineSteps.find(
               (s) => currentBeat >= s.startBeat && currentBeat < s.endBeat
             ) || timelineSteps[timelineSteps.length - 1];
           activeStep = foundStep;
-          setCurrentStepIndex(foundStep.index);
+          if (currentStepIndexRef.current !== foundStep.index) {
+            currentStepIndexRef.current = foundStep.index;
+            setCurrentStepIndex(foundStep.index);
+          }
 
           // Trigger guide piano note when entering a new step
           if (lastStepPlayedRef.current !== foundStep.index) {
@@ -562,7 +580,7 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
           }
         }
       } else {
-        activeStep = timelineSteps[currentStepIndex] || timelineSteps[0];
+        activeStep = timelineSteps[currentStepIndexRef.current] || timelineSteps[0];
       }
 
       // Detect Pitch (from real Microphone OR Simulator/Interactive Keyboard)
@@ -618,11 +636,13 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
         // Clamp display cents to [-99, +99] when comparing to current target step
         isOnTarget = Math.abs(centsDeviation) <= toleranceCents;
 
-        setLiveFreq(detectedFreq);
-        setLiveMidi(nearestMidi);
-        setLiveCents(Math.max(-99, Math.min(99, centsDeviation)));
-        setLiveRms(detectedRms);
-      } else {
+        if (pushUi) {
+          setLiveFreq(detectedFreq);
+          setLiveMidi(nearestMidi);
+          setLiveCents(Math.max(-99, Math.min(99, centsDeviation)));
+          setLiveRms(detectedRms);
+        }
+      } else if (pushUi) {
         setLiveFreq(null);
         setLiveMidi(null);
         setLiveCents(null);
@@ -854,10 +874,8 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
     timelineSteps,
     totalExerciseBeats,
     rootMidi,
-    currentStepIndex,
     guideVolume,
     toleranceCents,
-    requestAiAnalysis,
   ]);
 
   // Helper to get semantic pitch status (Never color alone: includes glyph + Italian text)

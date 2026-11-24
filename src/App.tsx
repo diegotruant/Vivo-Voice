@@ -173,55 +173,84 @@ export default function App() {
     []
   );
 
-  // Spoken Vocal Coach Playback via Server Gemini TTS (/api/vocal-coach/tts) with Web Speech fallback
-  const handlePlayCoachVoice = useCallback(async (text: string) => {
-    if (!text) return;
-    setIsPlayingTts(true);
+  // Spoken coach voice: AI TTS from the server when available (Gemini), otherwise browser speech.
+  // A playback token ensures only the most recent request can update isPlayingTts, so cancelling
+  // an older utterance (which fires its onerror/onend) can't end the new one's state early.
+  const ttsTokenRef = useRef<number>(0);
 
-    try {
-      if (audioPlayerRef.current) {
-        audioPlayerRef.current.pause();
-        audioPlayerRef.current = null;
-      }
-
-      const res = await coachFetch("/api/vocal-coach/tts", { text });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.audioBase64) {
-          const audio = new Audio(`data:audio/wav;base64,${data.audioBase64}`);
-          audioPlayerRef.current = audio;
-          audio.onended = () => setIsPlayingTts(false);
-          audio.onerror = () => setIsPlayingTts(false);
-          await audio.play();
-          return;
-        }
-      }
-
-      if ("speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-        const utter = new SpeechSynthesisUtterance(text);
-        utter.lang = "it-IT";
-        utter.rate = 0.98;
-        utter.onend = () => setIsPlayingTts(false);
-        utter.onerror = () => setIsPlayingTts(false);
-        window.speechSynthesis.speak(utter);
-      } else {
-        setIsPlayingTts(false);
-      }
-    } catch {
-      if ("speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-        const utter = new SpeechSynthesisUtterance(text);
-        utter.lang = "it-IT";
-        utter.onend = () => setIsPlayingTts(false);
-        utter.onerror = () => setIsPlayingTts(false);
-        window.speechSynthesis.speak(utter);
-      } else {
-        setIsPlayingTts(false);
-      }
+  const stopCoachVoice = useCallback(() => {
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.onended = null;
+      audioPlayerRef.current.onerror = null;
+      audioPlayerRef.current.pause();
+      audioPlayerRef.current = null;
+    }
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
     }
   }, []);
+
+  useEffect(() => {
+    return () => {
+      ttsTokenRef.current += 1;
+      stopCoachVoice();
+    };
+  }, [stopCoachVoice]);
+
+  const handlePlayCoachVoice = useCallback(
+    async (text: string) => {
+      if (!text) return;
+      const token = ++ttsTokenRef.current;
+      const isCurrent = () => token === ttsTokenRef.current;
+      const finish = () => {
+        if (isCurrent()) setIsPlayingTts(false);
+      };
+
+      stopCoachVoice();
+      setIsPlayingTts(true);
+
+      const speakWithBrowser = () => {
+        if (!isCurrent()) return;
+        if ("speechSynthesis" in window) {
+          window.speechSynthesis.cancel();
+          const utter = new SpeechSynthesisUtterance(text);
+          utter.lang = "it-IT";
+          utter.rate = 0.98;
+          utter.onend = finish;
+          utter.onerror = finish;
+          window.speechSynthesis.speak(utter);
+        } else {
+          finish();
+        }
+      };
+
+      try {
+        const res = await coachFetch("/api/vocal-coach/tts", { text });
+        if (!isCurrent()) return;
+        if (res.ok) {
+          const data = await res.json();
+          if (!isCurrent()) return;
+          if (data.audioBase64) {
+            const audio = new Audio(`data:${data.mimeType || "audio/wav"};base64,${data.audioBase64}`);
+            audioPlayerRef.current = audio;
+            audio.onended = finish;
+            audio.onerror = finish;
+            try {
+              await audio.play();
+              return;
+            } catch {
+              if (audioPlayerRef.current === audio) audioPlayerRef.current = null;
+              // fall through to browser speech
+            }
+          }
+        }
+        speakWithBrowser();
+      } catch {
+        speakWithBrowser();
+      }
+    },
+    [stopCoachVoice]
+  );
 
   return (
     <div className="min-h-screen flex flex-col bg-[#0F172A] text-slate-100">
