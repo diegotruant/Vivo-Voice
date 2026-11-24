@@ -98,6 +98,24 @@ jobs:
           path: out/*
           retention-days: 30
 
+      - name: Publish test APK (rolling pre-release "android-test")
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp out/*-debug.apk out/VoceViva-debug.apk
+          NOTES="Versione di prova Android (build ${VERSION_CODE}, commit ${GITHUB_SHA::7}, branch ${GITHUB_REF_NAME}).
+
+          Dal telefono: tocca **VoceViva-debug.apk** qui sotto, aprilo e consenti l'installazione da origini sconosciute.
+          Si installa sopra la versione di prova precedente (stessa firma). Non adatta al Play Store."
+          if ! gh release view android-test >/dev/null 2>&1; then
+            gh release create android-test --prerelease --target "$GITHUB_SHA" \
+              --title "VoceViva – versione di prova Android" --notes "$NOTES"
+          else
+            gh release edit android-test --prerelease --notes "$NOTES"
+          fi
+          gh release upload android-test out/VoceViva-debug.apk --clobber
+
       - name: Attach to GitHub Release
         if: github.event_name == 'release'
         env:
