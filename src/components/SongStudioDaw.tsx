@@ -31,15 +31,16 @@ import {
   VoiceRegisterId,
   SongDiagnosticResponse,
   PitchTelemetryPoint,
+  TrainingModuleId,
+  isTrainingModuleId,
 } from "../types/vocal";
+import { AiFallbackNotice, formatMeasured } from "./AiFallbackNotice";
 
 interface SongStudioDawProps {
   selectedRegisterId: VoiceRegisterId;
   onPlayCoachVoice: (text: string) => void;
   isPlayingTts: boolean;
-  onNavigateToModule: (
-    tab: "diaframma" | "riscaldamento" | "solfeggio" | "palestra"
-  ) => void;
+  onNavigateToModule: (tab: TrainingModuleId) => void;
 }
 
 interface WeakPassageRecord {
@@ -93,17 +94,22 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
   // Live Telemetry during Vocal Recording
   const [liveNoteLabel, setLiveNoteLabel] = useState<string>("—");
   const [liveCents, setLiveCents] = useState<number | null>(null);
-  const [liveAccuracy, setLiveAccuracy] = useState<number>(84);
-  const [liveStability, setLiveStability] = useState<number>(82);
-  const [avgCentsDev, setAvgCentsDev] = useState<number>(-6);
+  // All take metrics are null until something has actually been measured
+  const [liveAccuracy, setLiveAccuracy] = useState<number | null>(null);
+  const [liveStability, setLiveStability] = useState<number | null>(null);
+  const [avgCentsDev, setAvgCentsDev] = useState<number | null>(null);
   const [vibratoStats, setVibratoStats] = useState<{
     rateHz: number;
     extentCents: number;
     label: string;
-  }>({ rateHz: 5.6, extentCents: 38, label: "Vibrato Naturale" });
+  } | null>(null);
   const [weakPassages, setWeakPassages] = useState<WeakPassageRecord[]>([]);
-  const [minSungNote, setMinSungNote] = useState<string>("Do3");
-  const [maxSungNote, setMaxSungNote] = useState<string>("Sol4");
+  const [minSungNote, setMinSungNote] = useState<string | null>(null);
+  const [maxSungNote, setMaxSungNote] = useState<string | null>(null);
+  // True when the last recorded take contained too little pitched voice to measure
+  const [noDataDetected, setNoDataDetected] = useState<boolean>(false);
+  // True when the metrics shown come from the synthetic demo take, not the user's voice
+  const [isDemoTake, setIsDemoTake] = useState<boolean>(false);
 
   // AI Vocal Coach Diagnostic & Mastering Parameters
   const [isAnalyzingAi, setIsAnalyzingAi] = useState<boolean>(false);
@@ -385,28 +391,24 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     }
   };
 
-  // Run AI Coach Diagnosis & Auto-Configure Mastering Chain
+  // Run AI Coach Diagnosis & Auto-Configure Mastering Chain.
+  // Returns the AI mastering preset (or null) so the caller can apply it immediately.
   const runAiSongDiagnosis = async (
     acc: number,
     stab: number,
     avgCents: number,
     vib: { rateHz: number; extentCents: number },
     passages: WeakPassageRecord[],
-    lowN: string,
-    highN: string
-  ) => {
+    lowN: string | null,
+    highN: string | null
+  ): Promise<SongDiagnosticResponse["presetCorrezioneAi"] | null> => {
     setIsAnalyzingAi(true);
     try {
-      const weakStrings =
-        passages.length > 0
-          ? passages.map(
-              (p) =>
-                `al secondo ${p.timeSec.toFixed(1)}s sulla nota ${p.noteLabel}: ${p.issue} (${p.centsOff > 0 ? `+${p.centsOff}` : p.centsOff} cent)`
-            )
-          : [
-              "Lieve calo di sostegno diaframmatico nei finali di frase (circa -16 cent)",
-              "Transizione sul passaggio verso le note acute con laringe leggermente alta",
-            ];
+      // Only passages actually detected in the take — never invented ones
+      const weakStrings = passages.map(
+        (p) =>
+          `al secondo ${p.timeSec.toFixed(1)}s sulla nota ${p.noteLabel}: ${p.issue} (${p.centsOff > 0 ? `+${p.centsOff}` : p.centsOff} cent)`
+      );
 
       const res = await fetch("/api/vocal-coach/song-analyze", {
         method: "POST",
@@ -424,18 +426,29 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
           weakPassages: weakStrings,
         }),
       });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: SongDiagnosticResponse = await res.json();
       setAiDiagnosis(data);
-      if (data.presetCorrezioneAi) {
-        setPitchCorrectionAmount(
-          data.presetCorrezioneAi.pitchCorrectionAmount ?? 78
-        );
-        setSquilloBoostDb(data.presetCorrezioneAi.formantSquilloBoostDb ?? 3.5);
-        setCompressionRatio(data.presetCorrezioneAi.compressionRatio ?? 3.2);
-        setReverbWetPercent(data.presetCorrezioneAi.reverbWetPercent ?? 18);
-      }
+      const preset = data.presetCorrezioneAi;
+      if (!preset) return null;
+      const clampNum = (v: unknown, lo: number, hi: number, dflt: number) =>
+        typeof v === "number" && Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : dflt;
+      // Keep the AI's suggestions inside the ranges the mastering chain/sliders support
+      const safePreset = {
+        ...preset,
+        pitchCorrectionPercent: clampNum(preset.pitchCorrectionPercent, 0, 100, pitchCorrectionAmount),
+        eqPresenceDb: clampNum(preset.eqPresenceDb, 0, 8, squilloBoostDb),
+        compressionRatio: clampNum(preset.compressionRatio, 1.5, 8, compressionRatio),
+        reverbWetPercent: clampNum(preset.reverbWetPercent, 0, 50, reverbWetPercent),
+      };
+      setPitchCorrectionAmount(safePreset.pitchCorrectionPercent);
+      setSquilloBoostDb(safePreset.eqPresenceDb);
+      setCompressionRatio(safePreset.compressionRatio);
+      setReverbWetPercent(safePreset.reverbWetPercent);
+      return safePreset;
     } catch (err) {
       console.error("Errore analisi brano AI:", err);
+      return null;
     } finally {
       setIsAnalyzingAi(false);
     }
@@ -584,32 +597,44 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
 
     setRawVocalBuffer(vocalBuf);
 
-    // Summarize telemetry
+    // Summarize telemetry — only from real pitched frames; nothing is invented
     const pts = telemetryPointsRef.current;
-    let acc = 84;
-    let stab = 82;
-    let avgC = -5;
-    let lowLabel = "Do3";
-    let highLabel = "Sol4";
+    setAiDiagnosis(null);
+    setIsDemoTake(false);
 
-    if (pts.length > 3) {
-      const onTargetCount = pts.filter((p) => p.isOnTarget).length;
-      acc = Math.round((onTargetCount / pts.length) * 100);
-      const centsArr = pts.map((p) => p.centsOff || 0);
-      avgC = Math.round(
-        centsArr.reduce((a, b) => a + b, 0) / centsArr.length
-      );
-      const meanAbs =
-        centsArr.reduce((a, b) => a + Math.abs(b), 0) / centsArr.length;
-      stab = Math.max(45, Math.min(98, Math.round(100 - meanAbs * 1.1)));
+    if (pts.length <= 3) {
+      // Not enough sung material to measure anything: show "no data", skip AI analysis
+      setNoDataDetected(true);
+      setLiveAccuracy(null);
+      setLiveStability(null);
+      setAvgCentsDev(null);
+      setVibratoStats(null);
+      setMinSungNote(null);
+      setMaxSungNote(null);
+      setWeakPassages([]);
+      await masterVocalWithCurrentSettings(vocalBuf);
+      return;
+    }
+    setNoDataDetected(false);
 
-      const midis = pts
-        .map((p) => p.nearestMidi)
-        .filter((m): m is number => m !== null);
-      if (midis.length > 0) {
-        lowLabel = formatMidiNote(Math.min(...midis)).fullLabel;
-        highLabel = formatMidiNote(Math.max(...midis)).fullLabel;
-      }
+    const onTargetCount = pts.filter((p) => p.isOnTarget).length;
+    const acc = Math.round((onTargetCount / pts.length) * 100);
+    const centsArr = pts.map((p) => p.centsOff || 0);
+    const avgC = Math.round(
+      centsArr.reduce((a, b) => a + b, 0) / centsArr.length
+    );
+    const meanAbs =
+      centsArr.reduce((a, b) => a + Math.abs(b), 0) / centsArr.length;
+    const stab = Math.max(0, Math.min(100, Math.round(100 - meanAbs * 1.1)));
+
+    let lowLabel: string | null = null;
+    let highLabel: string | null = null;
+    const midis = pts
+      .map((p) => p.nearestMidi)
+      .filter((m): m is number => m !== null);
+    if (midis.length > 0) {
+      lowLabel = formatMidiNote(Math.min(...midis)).fullLabel;
+      highLabel = formatMidiNote(Math.max(...midis)).fullLabel;
     }
 
     const vib = analyzeVibratoFromPoints(pts);
@@ -625,8 +650,8 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     setMaxSungNote(highLabel);
     setWeakPassages([...weakPassagesRef.current]);
 
-    // Trigger AI Vocal Coach Diagnosis and AI Audio Mastering
-    await runAiSongDiagnosis(
+    // Trigger AI Vocal Coach Diagnosis, then master with the AI preset (or current sliders)
+    const preset = await runAiSongDiagnosis(
       acc,
       stab,
       avgC,
@@ -635,17 +660,26 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
       lowLabel,
       highLabel
     );
+    await masterVocalWithCurrentSettings(vocalBuf, preset);
+  };
 
+  // Mastering chain using the AI preset when available, otherwise the current slider values
+  const masterVocalWithCurrentSettings = async (
+    vocalBuf: AudioBuffer,
+    preset?: SongDiagnosticResponse["presetCorrezioneAi"] | null
+  ) => {
     setIsProcessingAudioAi(true);
     try {
       const mastered = await processVocalBufferWithAiMastering(vocalBuf, {
-        pitchCorrectionPercent: 78,
-        eqPresenceDb: 3.5,
-        compressionRatio: 3.2,
-        reverbWetPercent: 18,
+        pitchCorrectionPercent: preset?.pitchCorrectionPercent ?? pitchCorrectionAmount,
+        eqPresenceDb: preset?.eqPresenceDb ?? squilloBoostDb,
+        compressionRatio: preset?.compressionRatio ?? compressionRatio,
+        reverbWetPercent: preset?.reverbWetPercent ?? reverbWetPercent,
       });
       setCorrectedVocalBuffer(mastered);
       setUseAiCorrectedVocal(true);
+    } catch (err) {
+      console.error("Errore mastering vocale:", err);
     } finally {
       setIsProcessingAudioAi(false);
     }
@@ -655,6 +689,9 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
   const handleGenerateTestVocalTake = async () => {
     stopAllAudio();
     const ctx = getAudioCtx();
+    setNoDataDetected(false);
+    setIsDemoTake(true);
+    setAiDiagnosis(null);
     const duration = backingBuffer ? Math.min(16, backingBuffer.duration) : 16;
     const sr = ctx.sampleRate;
     const len = Math.floor(duration * sr);
@@ -1340,24 +1377,38 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-3 font-mono tabular-nums text-xs">
-            <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800">
-              Intonazione:{" "}
-              <strong className="text-emerald-400">{liveAccuracy}%</strong>
+            {isDemoTake && (
+              <div className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">
+                Valori del take demo sintetico (non la tua voce)
+              </div>
+            )}
+            <div
+              className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800"
+              title="Percentuale di istanti in cui la voce è entro ±32 cent dal semitono più vicino. Non confronta la voce con la melodia del brano."
+            >
+              Centratura cromatica:{" "}
+              <strong className="text-emerald-400">
+                {liveAccuracy === null ? "—" : formatMeasured(liveAccuracy)}
+              </strong>
             </div>
             <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800">
               Stabilità:{" "}
-              <strong className="text-sky-400">{liveStability}%</strong>
+              <strong className="text-sky-400">
+                {liveStability === null ? "—" : formatMeasured(liveStability)}
+              </strong>
             </div>
             <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800">
               Vibrato:{" "}
               <strong className="text-amber-300">
-                {vibratoStats.rateHz} Hz (±{vibratoStats.extentCents} cent)
+                {vibratoStats
+                  ? `${vibratoStats.rateHz} Hz (±${vibratoStats.extentCents} cent)`
+                  : "—"}
               </strong>
             </div>
             <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800">
               Range Brano:{" "}
               <strong className="text-slate-200">
-                {minSungNote} – {maxSungNote}
+                {minSungNote && maxSungNote ? `${minSungNote} – ${maxSungNote}` : "—"}
               </strong>
             </div>
           </div>
@@ -1370,7 +1421,15 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
           </div>
         )}
 
-        {!aiDiagnosis && !isAnalyzingAi && (
+        {noDataDetected && !isAnalyzingAi && (
+          <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/40 text-xs text-amber-300 leading-relaxed">
+            <strong>Nessun dato rilevato:</strong> nella registrazione non c&apos;era abbastanza voce
+            intonata da misurare (microfono muto, troppo lontano o solo parlato). Nessuna analisi è
+            stata generata: riprova cantando più vicino al microfono.
+          </div>
+        )}
+
+        {!aiDiagnosis && !isAnalyzingAi && !noDataDetected && (
           <div className="p-6 rounded-xl bg-slate-950/70 border border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4">
             <div className="text-xs text-slate-300 max-w-2xl leading-relaxed">
               Carica la tua base musicale MP3/WAV (oppure usa gli stem da studio
@@ -1397,6 +1456,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
 
         {aiDiagnosis && (
           <div className="flex flex-col gap-5">
+            <AiFallbackNotice show={aiDiagnosis.isFallback} />
             {/* Summary Banner + Voice Playback */}
             <div className="bg-slate-950 border border-sky-500/30 rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
               <div className="flex flex-col gap-1">
@@ -1406,10 +1466,14 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
                 <p className="text-sm text-slate-100 leading-relaxed">
                   {aiDiagnosis.sintesiPerformance}
                 </p>
-                {aiDiagnosis.presetCorrezioneAi?.spiegazioneMastering && (
+                {aiDiagnosis.presetCorrezioneAi?.motivazioneSoundEngineer && (
                   <p className="text-xs text-emerald-400 mt-1">
-                    <strong>Intervento AI applicato alla traccia: </strong>
-                    {aiDiagnosis.presetCorrezioneAi.spiegazioneMastering}
+                    <strong>
+                      {aiDiagnosis.isFallback
+                        ? "Impostazioni di mastering predefinite: "
+                        : "Intervento AI applicato alla traccia: "}
+                    </strong>
+                    {aiDiagnosis.presetCorrezioneAi.motivazioneSoundEngineer}
                   </p>
                 )}
               </div>
@@ -1419,7 +1483,7 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
                 onClick={() =>
                   onPlayCoachVoice(aiDiagnosis.messaggioVocaleCoach)
                 }
-                disabled={isPlayingTts}
+                disabled={isPlayingTts || !aiDiagnosis.messaggioVocaleCoach}
                 className="flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold bg-sky-500 hover:bg-sky-400 text-slate-950 whitespace-nowrap shrink-0"
               >
                 <Headphones className="w-4 h-4" />
@@ -1441,7 +1505,10 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
                 </div>
 
                 <div className="flex flex-col gap-3">
-                  {aiDiagnosis.puntiDiForza.map((pf, i) => (
+                  {(aiDiagnosis.puntiDiForza ?? []).length === 0 && (
+                    <p className="text-xs text-slate-400">Nessun punto di forza indicato.</p>
+                  )}
+                  {(aiDiagnosis.puntiDiForza ?? []).map((pf, i) => (
                     <div
                       key={i}
                       className="bg-slate-900/90 border border-slate-800 rounded-lg p-3.5"
@@ -1465,23 +1532,28 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
                 </div>
 
                 <div className="flex flex-col gap-3">
-                  {aiDiagnosis.puntiDeboliDaAllenare.map((pd, i) => (
+                  {(aiDiagnosis.puntiDeboliDaAllenare ?? []).length === 0 && (
+                    <p className="text-xs text-slate-400">Nessun punto debole indicato.</p>
+                  )}
+                  {(aiDiagnosis.puntiDeboliDaAllenare ?? []).map((pd, i) => (
                     <div
                       key={i}
                       className="bg-slate-900/90 border border-slate-800 rounded-lg p-3.5 flex flex-col gap-2"
                     >
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <span className="text-xs font-semibold text-amber-300">
-                          ▲ {pd.area}
+                          ▲ {pd.problema}
                         </span>
-                        <button
-                          type="button"
-                          onClick={() => onNavigateToModule(pd.moduloApp)}
-                          className="flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/30 transition-colors"
-                        >
-                          <span>Allenati nel Modulo {pd.moduloApp.toUpperCase()}</span>
-                          <ArrowRight className="w-3 h-3" />
-                        </button>
+                        {isTrainingModuleId(pd.moduloApp) && (
+                          <button
+                            type="button"
+                            onClick={() => onNavigateToModule(pd.moduloApp)}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/30 transition-colors"
+                          >
+                            <span>Allenati nel Modulo {pd.moduloApp.toUpperCase()}</span>
+                            <ArrowRight className="w-3 h-3" />
+                          </button>
+                        )}
                       </div>
                       <p className="text-xs text-slate-300 leading-relaxed">
                         <strong className="text-slate-100">

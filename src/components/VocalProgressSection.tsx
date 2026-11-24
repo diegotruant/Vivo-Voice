@@ -15,21 +15,40 @@ import {
   TrendingUp,
   Target,
   Award,
-  PlusCircle,
   RotateCcw,
 } from "lucide-react";
 import { VocalSessionRecord } from "../types/vocal";
 
 interface VocalProgressSectionProps {
   sessions: VocalSessionRecord[];
-  onAddSimulatedSession: () => void;
   onResetHistory: () => void;
   onNavigateToStudio: () => void;
 }
 
+/** Absolute Italian date label from the stored ISO date (legacy records keep their label). */
+function formatSessionDate(s: VocalSessionRecord): string {
+  if (s.fullDate && s.fullDate.length > 10) {
+    const d = new Date(s.fullDate);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toLocaleString("it-IT", {
+        day: "numeric",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    }
+  }
+  // Legacy records stored a relative "Oggi HH:MM" label plus a YYYY-MM-DD date
+  if (s.dateLabel?.startsWith("Oggi") && /^\d{4}-\d{2}-\d{2}$/.test(s.fullDate)) {
+    const d = new Date(`${s.fullDate}T00:00:00`);
+    const day = d.toLocaleDateString("it-IT", { day: "numeric", month: "short" });
+    return `${day}${s.dateLabel.slice(4)}`;
+  }
+  return s.dateLabel;
+}
+
 export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
   sessions,
-  onAddSimulatedSession,
   onResetHistory,
   onNavigateToStudio,
 }) => {
@@ -43,8 +62,12 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
   }, [sessions]);
 
   const filteredSessions = useMemo(() => {
-    if (selectedCategory === "Tutte") return sessions;
-    return sessions.filter((s) => s.category === selectedCategory);
+    const base =
+      selectedCategory === "Tutte"
+        ? sessions
+        : sessions.filter((s) => s.category === selectedCategory);
+    // Date label derived at render time from the stored ISO date
+    return base.map((s) => ({ ...s, dateLabel: formatSessionDate(s) }));
   }, [sessions, selectedCategory]);
 
   // Compute aggregate KPIs with tabular precision
@@ -53,10 +76,10 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
       return {
         latestAccuracy: 0,
         avgAccuracy: 0,
-        improvementDelta: 0,
+        improvementDelta: null as number | null,
         avgStability: 0,
         avgAbsCents: 0,
-        totalMinutes: 0,
+        totalMinutes: null as number | null,
       };
     }
     const firstAcc = filteredSessions[0].accuracyPercent;
@@ -71,17 +94,44 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
       (acc, s) => acc + Math.abs(s.avgCentsDeviation),
       0
     );
-    const totalMin = filteredSessions.reduce((acc, s) => acc + s.durationMin, 0);
+    // durationMin 0 = not measured; only sum measured durations
+    const measured = filteredSessions.filter((s) => s.durationMin > 0);
+    const totalMin =
+      measured.length > 0
+        ? Math.round(measured.reduce((acc, s) => acc + s.durationMin, 0))
+        : null;
 
     return {
       latestAccuracy: latestAcc,
       avgAccuracy: Math.round(sumAcc / filteredSessions.length),
-      improvementDelta: latestAcc - firstAcc,
+      // Only meaningful with at least two sessions
+      improvementDelta: filteredSessions.length >= 2 ? latestAcc - firstAcc : null,
       avgStability: Math.round(sumStab / filteredSessions.length),
       avgAbsCents: +(sumAbsCents / filteredSessions.length).toFixed(1),
       totalMinutes: totalMin,
     };
   }, [filteredSessions]);
+
+  if (sessions.length === 0) {
+    return (
+      <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-10 flex flex-col items-center text-center gap-4">
+        <TrendingUp className="w-8 h-8 text-sky-400" />
+        <h2 className="text-xl font-semibold text-slate-100">Nessuna sessione ancora</h2>
+        <p className="text-sm text-slate-400 max-w-lg">
+          Completa un esercizio nella Palestra Vocale con il microfono attivo: ogni sessione
+          misurata (accuratezza, stabilità, scarto in cent) comparirà qui e potrai seguire i tuoi
+          progressi nel tempo.
+        </p>
+        <button
+          type="button"
+          onClick={onNavigateToStudio}
+          className="px-4 py-2 rounded-lg text-sm font-semibold bg-sky-500 hover:bg-sky-400 text-slate-950"
+        >
+          Vai alla Palestra Vocale →
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-6">
@@ -93,15 +143,19 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
             <span className="text-2xl font-bold text-slate-100">
               {stats.latestAccuracy}%
             </span>
-            <span
-              className={`text-xs font-semibold ${
-                stats.improvementDelta >= 0 ? "text-emerald-400" : "text-amber-400"
-              }`}
-            >
-              {stats.improvementDelta >= 0
-                ? `▲ +${stats.improvementDelta}% vs Inizio`
-                : `▼ ${stats.improvementDelta}% vs Inizio`}
-            </span>
+            {stats.improvementDelta !== null ? (
+              <span
+                className={`text-xs font-semibold ${
+                  stats.improvementDelta >= 0 ? "text-emerald-400" : "text-amber-400"
+                }`}
+              >
+                {stats.improvementDelta >= 0
+                  ? `▲ +${stats.improvementDelta}% vs Inizio`
+                  : `▼ ${stats.improvementDelta}% vs Inizio`}
+              </span>
+            ) : (
+              <span className="text-xs text-slate-500">prima sessione</span>
+            )}
           </div>
           <div className="text-xs text-slate-400 mt-1">
             Media periodo: <span className="font-mono text-slate-200">{stats.avgAccuracy}%</span>
@@ -113,9 +167,6 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
           <div className="mt-1.5 flex items-baseline justify-between font-mono tabular-nums">
             <span className="text-2xl font-bold text-sky-400">
               {stats.avgStability}%
-            </span>
-            <span className="text-xs text-sky-300 font-semibold">
-              ● APPOGGIO COSTANTE
             </span>
           </div>
           <div className="text-xs text-slate-400 mt-1">
@@ -145,7 +196,7 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
               {filteredSessions.length} sessioni
             </span>
             <span className="text-xs text-slate-300">
-              {stats.totalMinutes} min totali
+              {stats.totalMinutes !== null ? `${stats.totalMinutes} min totali` : "— min"}
             </span>
           </div>
           <div className="text-xs text-slate-400 mt-1">
@@ -219,19 +270,19 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={onAddSimulatedSession}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-sky-300 transition-colors whitespace-nowrap shrink-0"
-              >
-                <PlusCircle className="w-3.5 h-3.5" />
-                <span>Registra Sessione Test</span>
-              </button>
-              <button
-                type="button"
-                onClick={onResetHistory}
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      "Cancellare definitivamente tutte le sessioni registrate?"
+                    )
+                  ) {
+                    onResetHistory();
+                  }
+                }}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-950 hover:bg-slate-800 text-slate-400 border border-slate-800 transition-colors whitespace-nowrap shrink-0"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                <span>Ripristina</span>
+                <span>Cancella Storico</span>
               </button>
             </div>
           </div>
@@ -267,7 +318,7 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
                     fontFamily="IBM Plex Mono, monospace"
                   />
                   <YAxis
-                    domain={[50, 100]}
+                    domain={[0, 100]}
                     stroke="#64748B"
                     fontSize={11}
                     tickLine={false}
@@ -345,7 +396,10 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
                     fontFamily="IBM Plex Mono, monospace"
                   />
                   <YAxis
-                    domain={[-30, 30]}
+                    domain={[
+                      (dataMin: number) => Math.min(-30, Math.floor(dataMin)),
+                      (dataMax: number) => Math.max(30, Math.ceil(dataMax)),
+                    ]}
                     stroke="#64748B"
                     fontSize={11}
                     tickLine={false}
@@ -446,7 +500,7 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
                       c
                     </span>
                     <span>·</span>
-                    <span>{session.durationMin} min</span>
+                    <span>{session.durationMin > 0 ? `${session.durationMin} min` : "— min"}</span>
                   </div>
 
                   {session.coachNote && (

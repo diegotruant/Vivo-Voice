@@ -14,6 +14,7 @@ import {
   Sparkles,
   Clock,
 } from "lucide-react";
+import { AiFallbackNotice } from "./AiFallbackNotice";
 import {
   studioAudio,
   formatMidiNote,
@@ -160,11 +161,23 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
     feedbackMaestro: string;
     correzioneTecnica: string;
     fraseVocaleCoach: string;
+    isFallback?: boolean;
   } | null>(null);
+  const [micError, setMicError] = useState<string | null>(null);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const micPendingRef = useRef<boolean>(false);
+  const mountedRef = useRef<boolean>(true);
+  // True while the exercise timer is running on a stage (not resting): only then phonation is measured
+  const measuringRef = useRef<boolean>(false);
+  // Measured phonation per stage: seconds with voice and seconds above the safe volume
+  const stageStatsRef = useRef<Record<string, { voicedSec: number; overSec: number }>>({});
+
+  useEffect(() => {
+    measuringRef.current = isRunning && !isResting;
+  }, [isRunning, isResting]);
 
   const rootMidi = currentRegister.baseExerciseMidi;
 
@@ -179,12 +192,22 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
   };
 
   // Start / Stop Microphone Anti-Strain Monitor
+  const releaseMic = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+    analyserRef.current = null;
+  };
+
   const toggleMicMonitor = async () => {
+    if (micPendingRef.current) return;
     if (micActive) {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
-      }
+      releaseMic();
       setMicActive(false);
       setLiveVolumePercent(0);
       setLiveFreqHz(null);
@@ -192,8 +215,20 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
       return;
     }
 
+    micPendingRef.current = true;
+    setMicError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+      if (!mountedRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       streamRef.current = stream;
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const ctx = new AudioCtx();
@@ -204,16 +239,27 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
       src.connect(analyser);
       analyserRef.current = analyser;
       setMicActive(true);
-    } catch {
+    } catch (err) {
+      releaseMic();
       setMicActive(false);
+      const name = (err as { name?: string })?.name;
+      setMicError(
+        name === "NotAllowedError"
+          ? "Accesso al microfono negato: abilitalo nelle impostazioni del browser."
+          : name === "NotFoundError"
+            ? "Nessun microfono trovato: collega un microfono e riprova."
+            : "Impossibile attivare il microfono."
+      );
+    } finally {
+      micPendingRef.current = false;
     }
   };
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-      }
+      mountedRef.current = false;
+      releaseMic();
     };
   }, []);
 
@@ -222,8 +268,12 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
     if (!micActive) return;
     let rafId: number;
     const buf = new Float32Array(2048);
+    let smoothed = 0;
+    let lastT = performance.now();
+    // Below this (smoothed) level the frame is treated as silence / room noise
+    const VOICED_THRESHOLD = 6;
 
-    const monitorLoop = () => {
+    const monitorLoop = (now: number) => {
       if (analyserRef.current && audioCtxRef.current) {
         analyserRef.current.getFloatTimeDomainData(buf);
         let sum = 0;
@@ -231,9 +281,20 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
           sum += buf[i] * buf[i];
         }
         const rms = Math.sqrt(sum / buf.length);
-        const volPct = Math.min(100, Math.round(rms * 380));
-        setLiveVolumePercent(volPct);
-        setIsOverpushing(volPct > activeStage.maxSafeRmsPercent);
+        const volPct = Math.min(100, rms * 380);
+        // ~300 ms exponential smoothing so single plosives don't trip the strain alarm
+        const dt = Math.min(0.2, Math.max(0, (now - lastT) / 1000));
+        lastT = now;
+        smoothed += (volPct - smoothed) * (1 - Math.exp(-dt / 0.3));
+        const over = smoothed > activeStage.maxSafeRmsPercent;
+        setLiveVolumePercent(Math.round(smoothed));
+        setIsOverpushing(over);
+
+        if (measuringRef.current && smoothed > VOICED_THRESHOLD) {
+          const st = (stageStatsRef.current[activeStage.id] ??= { voicedSec: 0, overSec: 0 });
+          st.voicedSec += dt;
+          if (over) st.overSec += dt;
+        }
 
         const pitchRes = detectPitchAutocorrelation(
           buf,
@@ -246,52 +307,51 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
 
     rafId = requestAnimationFrame(monitorLoop);
     return () => cancelAnimationFrame(rafId);
-  }, [micActive, activeStage.maxSafeRmsPercent]);
+  }, [micActive, activeStage.id, activeStage.maxSafeRmsPercent]);
 
   // Countdown Timer with Automatic Anti-Strain Rest Period between stages
   useEffect(() => {
     if (!isRunning) return;
 
     const timer = setInterval(() => {
-      setRemainingSec((prev) => {
-        if (prev > 1) {
-          if (!isResting) {
-            setTotalWarmupSecondsLogged((t) => t + 1);
-          }
-          return prev - 1;
-        }
-
-        // Phase reached 0!
-        studioAudio.playMetronomeTick(true, 0.25);
-
-        if (!isResting) {
-          // Mark current stage completed and transition to mandatory 15s vocal fold rest
-          setCompletedStageIds((ids) =>
-            ids.includes(activeStage.id) ? ids : [...ids, activeStage.id]
-          );
-          setIsResting(true);
-          return activeStage.restSec;
-        } else {
-          // Rest completed -> advance to next stage or finish
-          setIsResting(false);
-          if (currentStageIdx < WARMUP_STAGES.length - 1) {
-            const nextIdx = currentStageIdx + 1;
-            const nextStage = WARMUP_STAGES[nextIdx];
-            setCurrentStageIdx(nextIdx);
-            setStageDurationSec(nextStage.recommendedSec);
-            setIsRunning(false);
-            return nextStage.recommendedSec;
-          } else {
-            setIsRunning(false);
-            requestWarmupCoachFeedback();
-            return activeStage.recommendedSec;
-          }
-        }
-      });
+      setRemainingSec((prev) => Math.max(0, prev - 1));
+      if (!isResting) {
+        setTotalWarmupSecondsLogged((t) => t + 1);
+      }
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [isRunning, isResting, activeStage, currentStageIdx]);
+  }, [isRunning, isResting]);
+
+  // Phase transitions when the countdown reaches 0 (kept out of the state updater: no side effects there)
+  useEffect(() => {
+    if (!isRunning || remainingSec > 0) return;
+    studioAudio.playMetronomeTick(true, 0.25);
+
+    if (!isResting) {
+      // Mark current stage completed and transition to the mandatory vocal fold rest
+      setCompletedStageIds((ids) =>
+        ids.includes(activeStage.id) ? ids : [...ids, activeStage.id]
+      );
+      setIsResting(true);
+      setRemainingSec(activeStage.restSec);
+      return;
+    }
+
+    // Rest completed -> advance to next stage or finish
+    setIsResting(false);
+    setIsRunning(false);
+    if (currentStageIdx < WARMUP_STAGES.length - 1) {
+      const nextStage = WARMUP_STAGES[currentStageIdx + 1];
+      setCurrentStageIdx(currentStageIdx + 1);
+      setStageDurationSec(nextStage.recommendedSec);
+      setRemainingSec(nextStage.recommendedSec);
+    } else {
+      setRemainingSec(activeStage.recommendedSec);
+      requestWarmupCoachFeedback();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remainingSec, isRunning, isResting]);
 
   // Play Synthesized Audio Demonstration for the current Warmup Stage
   const handlePlayStageDemo = () => {
@@ -308,6 +368,28 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
 
   const requestWarmupCoachFeedback = async () => {
     setIsEvaluating(true);
+    const stats = stageStatsRef.current;
+    const totalVoiced = Object.values(stats).reduce((a, st) => a + st.voicedSec, 0);
+    const totalOver = Object.values(stats).reduce((a, st) => a + st.overSec, 0);
+    const measured = totalVoiced >= 1;
+    const safePercent = measured
+      ? Math.round((100 * (totalVoiced - totalOver)) / totalVoiced)
+      : null;
+    const perStage = WARMUP_STAGES.filter((st) => stats[st.id])
+      .map(
+        (st) =>
+          `${st.code}: ${Math.round(stats[st.id].voicedSec)}s di fonazione, ${Math.round(
+            stats[st.id].overSec
+          )}s oltre il volume sicuro`
+      )
+      .join("; ");
+    const details = measured
+      ? `Fasi completate: ${completedStageIds.length}/${WARMUP_STAGES.length}. Tempo di timer esercizio: ${totalWarmupSecondsLogged}s. Fonazione misurata col microfono: ${Math.round(totalVoiced)}s, di cui entro il volume sicuro ${safePercent}%. Dettaglio: ${perStage}.`
+      : `Fasi completate: ${completedStageIds.length}/${WARMUP_STAGES.length}. Tempo di timer esercizio: ${totalWarmupSecondsLogged}s. ${
+          micActive
+            ? "Microfono attivo ma nessuna fonazione rilevata durante il timer: volume non misurato."
+            : "Microfono non attivo: controllo del volume anti-sforzo non misurato."
+        }`;
     try {
       const res = await fetch("/api/vocal-coach/lesson-coach", {
         method: "POST",
@@ -315,11 +397,12 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
         body: JSON.stringify({
           moduleType: "Riscaldamento SOVTE (Vocal Fry & Lip Trill)",
           exerciseName: activeStage.title,
-          scorePercent: isOverpushing ? 76 : 94,
+          scorePercent: safePercent ?? "non misurato",
           voiceType: currentRegister.name,
-          details: `Fasi completate: ${completedStageIds.length + 1}/4. Tempo totale riscaldamento controllato: ${totalWarmupSecondsLogged}s. Controllo volume anti-sforzo rispettato.`,
+          details,
         }),
       });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setCoachFeedback(data);
     } catch (e) {
@@ -490,7 +573,7 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
                       fontSize="10"
                       fontFamily="IBM Plex Mono"
                     >
-                      Impulsi M0 (~42 Hz · Pressione Minima)
+                      Impulsi M0 (~42 Hz indicativo · non misurato)
                     </text>
                   </>
                 ) : (
@@ -586,7 +669,8 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
                       isResting ? "text-amber-400" : "text-sky-400"
                     }`}
                   >
-                    00:{remainingSec < 10 ? `0${remainingSec}` : remainingSec}
+                    {String(Math.floor(remainingSec / 60)).padStart(2, "0")}:
+                    {String(remainingSec % 60).padStart(2, "0")}
                   </span>
                   <span className="text-xs text-slate-400">
                     {isResting
@@ -697,6 +781,8 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
                 )}
               </button>
             </div>
+
+            {micError && <p className="text-[11px] text-rose-400">{micError}</p>}
 
             {micActive && (
               <div className="flex flex-col gap-1.5 font-mono text-xs">
@@ -815,6 +901,7 @@ export const WarmupCoach: React.FC<WarmupCoachProps> = ({
                   <span>Ascolta Voce</span>
                 </button>
               </div>
+              <AiFallbackNotice show={coachFeedback.isFallback} />
               <p className="text-xs text-slate-200 leading-relaxed">
                 {coachFeedback.feedbackMaestro}
               </p>

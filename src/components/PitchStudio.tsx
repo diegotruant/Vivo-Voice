@@ -30,6 +30,31 @@ import {
   PitchTelemetryPoint,
   AiAnalysisResult,
 } from "../types/vocal";
+import { AiFallbackNotice } from "./AiFallbackNotice";
+
+type VibratoReading = {
+  rateHz: number;
+  extentCents: number;
+  statusLabel: string;
+  isNominal: boolean;
+};
+
+// Minimum share of the exercise that must contain detected singing before a session is scored
+const MIN_COVERAGE_PERCENT = 30;
+
+function describeMicError(err: unknown): string {
+  const name = (err as { name?: string } | null)?.name;
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    return "Permesso microfono negato. Consenti l'accesso al microfono nelle impostazioni del browser e riprova.";
+  }
+  if (name === "NotFoundError" || name === "OverconstrainedError") {
+    return "Nessun microfono trovato. Collega un microfono (o le cuffie con microfono) e riprova.";
+  }
+  if (name === "NotReadableError") {
+    return "Il microfono è occupato da un'altra applicazione. Chiudila e riprova.";
+  }
+  return "Impossibile accedere al microfono. Controlla il dispositivo e riprova.";
+}
 
 interface PitchStudioProps {
   selectedRegisterId: VoiceRegisterId;
@@ -40,7 +65,8 @@ interface PitchStudioProps {
     exerciseTitle: string,
     stability: number,
     avgCents: number,
-    category: string
+    category: string,
+    durationMin?: number
   ) => void;
   onPlayCoachVoice: (text: string) => void;
   isPlayingTts: boolean;
@@ -79,20 +105,15 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
   const [liveMidi, setLiveMidi] = useState<number | null>(null);
   const [liveCents, setLiveCents] = useState<number | null>(null);
   const [liveRms, setLiveRms] = useState<number>(0);
-  const [sessionAccuracy, setSessionAccuracy] = useState<number>(0);
-  const [sessionStability, setSessionStability] = useState<number>(88);
-  const [avgCentsSession, setAvgCentsSession] = useState<number>(0);
-  const [vibratoInfo, setVibratoInfo] = useState<{
-    rateHz: number;
-    extentCents: number;
-    statusLabel: string;
-    isNominal: boolean;
-  }>({
-    rateHz: 5.5,
-    extentCents: 28,
-    statusLabel: "● VIBRATO NATURALE",
-    isNominal: true,
-  });
+  // Session metrics are null until something has actually been measured
+  const [sessionAccuracy, setSessionAccuracy] = useState<number | null>(null);
+  const [sessionStability, setSessionStability] = useState<number | null>(null);
+  const [avgCentsSession, setAvgCentsSession] = useState<number | null>(null);
+  const [sessionCoverage, setSessionCoverage] = useState<number | null>(null);
+  const [vibratoInfo, setVibratoInfo] = useState<VibratoReading | null>(null);
+  const [analysisNotice, setAnalysisNotice] = useState<string | null>(null);
+  // When the user wears headphones the guide piano can't leak into the mic, so no masking is needed
+  const [usingHeadphones, setUsingHeadphones] = useState<boolean>(false);
 
   // AI Coach analysis state
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
@@ -114,6 +135,20 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
   const inputModeRef = useRef<"mic" | "simulator">(inputMode);
   const manualHeldMidiRef = useRef<number | null>(null);
   const simOffsetRef = useRef<number>(0);
+  // Input source the current session was started with (simulated sessions are never saved)
+  const sessionSourceRef = useRef<"mic" | "simulator">("mic");
+  // Until this timestamp the guide piano is sounding: mic frames are not scored (piano bleed)
+  const guideMaskUntilMsRef = useRef<number>(0);
+  const usingHeadphonesRef = useRef<boolean>(false);
+  // Rolling buffer of live pitch frames (~1.5 s) for vibrato analysis, running or not
+  const liveVibratoBufRef = useRef<Array<{ timestamp: number; detectedMidiFloat: number | null }>>([]);
+  const frameCounterRef = useRef<number>(0);
+  const micStartingRef = useRef<boolean>(false);
+  const isMountedRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    usingHeadphonesRef.current = usingHeadphones;
+  }, [usingHeadphones]);
 
   useEffect(() => {
     inputModeRef.current = inputMode;
@@ -153,8 +188,11 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
   const totalExerciseBeats =
     timelineSteps.length > 0 ? timelineSteps[timelineSteps.length - 1].endBeat : 8;
 
-  // Start / Stop Microphone
-  const startMicrophone = async () => {
+  // Start / Stop Microphone. Returns true when the mic is live.
+  const startMicrophone = async (): Promise<boolean> => {
+    if (micStreamRef.current) return true;
+    if (micStartingRef.current) return false;
+    micStartingRef.current = true;
     setMicError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -164,6 +202,10 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
           noiseSuppression: false,
         },
       });
+      if (!isMountedRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return false;
+      }
       micStreamRef.current = stream;
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const ctx = new AudioCtx();
@@ -177,13 +219,41 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
 
       setMicActive(true);
       setInputMode("mic");
-    } catch (err: any) {
-      setMicError(
-        "Accesso al microfono non disponibile. Modalità Simulatore Interattivo attivata automaticamente."
-      );
-      setInputMode("simulator");
+      return true;
+    } catch (err: unknown) {
+      // Stay in mic mode: never silently replace the user's voice with simulated singing
+      setMicError(describeMicError(err));
       setMicActive(false);
+      return false;
+    } finally {
+      micStartingRef.current = false;
     }
+  };
+
+  // Stop a running MediaRecorder WITHOUT triggering analysis/save of a partial take
+  const discardRecorder = () => {
+    const rec = mediaRecorderRef.current;
+    if (rec) {
+      rec.onstop = null;
+      rec.ondataavailable = null;
+      if (rec.state !== "inactive") {
+        try {
+          rec.stop();
+        } catch {
+          /* already stopped */
+        }
+      }
+      mediaRecorderRef.current = null;
+    }
+    recordedChunksRef.current = [];
+  };
+
+  const resetSessionMetrics = () => {
+    setSessionAccuracy(null);
+    setSessionStability(null);
+    setAvgCentsSession(null);
+    setSessionCoverage(null);
+    setAnalysisNotice(null);
   };
 
   const stopMicrophone = () => {
@@ -200,7 +270,10 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
   };
 
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
+      discardRecorder();
       stopMicrophone();
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
     };
@@ -208,8 +281,10 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
 
   // Select exercise handler
   const handleSelectExercise = (ex: VocalExercise) => {
+    discardRecorder();
     setIsRunning(false);
     isRunningRef.current = false;
+    resetSessionMetrics();
     setSelectedExercise(ex);
     setBpm(ex.defaultBpm);
     setElapsedBeats(0);
@@ -218,40 +293,54 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
     setAiResult(null);
   };
 
-  // Request AI Coach Analysis from backend
+  // Request AI Coach Analysis from backend (only for real microphone sessions with enough data)
   const requestAiAnalysis = useCallback(
     async (recordedBlob?: Blob) => {
+      if (!isMountedRef.current) return;
+
+      if (sessionSourceRef.current === "simulator") {
+        setAnalysisNotice(
+          "Demo simulata: questa esecuzione è generata dal simulatore, quindi non viene salvata nei progressi né inviata al Maestro AI."
+        );
+        return;
+      }
+
+      const allPoints = telemetryRef.current;
+      const points = allPoints.filter((p) => p.detectedMidiFloat !== null);
+      const coverage =
+        allPoints.length > 0 ? Math.round((points.length / allPoints.length) * 100) : 0;
+
+      if (points.length === 0 || coverage < MIN_COVERAGE_PERCENT) {
+        setSessionCoverage(allPoints.length > 0 ? coverage : null);
+        setAnalysisNotice(
+          points.length === 0
+            ? "Nessun dato rilevato: avvia il vocalizzo con il microfono attivo e canta le note guida prima di chiedere la valutazione."
+            : `Dati insufficienti: la voce è stata rilevata solo nel ${coverage}% dell'esercizio (minimo ${MIN_COVERAGE_PERCENT}%). Nessuna valutazione salvata.`
+        );
+        return;
+      }
+
+      setAnalysisNotice(null);
       setIsAnalyzing(true);
       try {
-        const points = telemetryRef.current.filter((p) => p.detectedMidiFloat !== null);
-        let acc = sessionAccuracy;
-        let avgCents = avgCentsSession;
-        let stab = sessionStability;
+        const onTargetCount = points.filter((p) => p.isOnTarget).length;
+        const acc = Math.round((onTargetCount / points.length) * 100);
+        const sumCents = points.reduce((accSum, p) => accSum + (p.centsOff ?? 0), 0);
+        const avgCents = Math.round(sumCents / points.length);
 
-        if (points.length > 0) {
-          const onTargetCount = points.filter((p) => p.isOnTarget).length;
-          acc = Math.round((onTargetCount / points.length) * 100);
-          const sumCents = points.reduce((accSum, p) => accSum + (p.centsOff || 0), 0);
-          avgCents = Math.round(sumCents / points.length);
+        // Pitch spread (standard deviation in cents) → stability, unclamped except at 0
+        const variance =
+          points.reduce(
+            (vSum, p) => vSum + Math.pow((p.centsOff ?? 0) - avgCents, 2),
+            0
+          ) / points.length;
+        const stdDev = Math.sqrt(variance);
+        const stab = Math.max(0, Math.round(100 - stdDev * 1.1));
 
-          // Compute pitch variance for stability
-          const variance =
-            points.reduce(
-              (vSum, p) => vSum + Math.pow((p.centsOff || 0) - avgCents, 2),
-              0
-            ) / points.length;
-          const stdDev = Math.sqrt(variance);
-          stab = Math.max(40, Math.min(99, Math.round(100 - stdDev * 1.1)));
-
-          setSessionAccuracy(acc);
-          setAvgCentsSession(avgCents);
-          setSessionStability(stab);
-        } else {
-          // If user clicks analyze before singing a full session, use realistic baseline metrics
-          acc = acc || 84;
-          avgCents = avgCents || -4;
-          stab = stab || 86;
-        }
+        setSessionAccuracy(acc);
+        setAvgCentsSession(avgCents);
+        setSessionStability(stab);
+        setSessionCoverage(coverage);
 
         // Identify critical notes where centsOff exceeded tolerance
         const missedMidis = new Set<string>();
@@ -277,6 +366,12 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
           });
         }
 
+        // Real duration of the measured session (first → last scored frame)
+        const durationMin =
+          allPoints.length > 1
+            ? (allPoints[allPoints.length - 1].timestamp - startTimeMsRef.current) / 60000
+            : undefined;
+
         const tendency =
           avgCents < -7
             ? "Tendenza Calante (Flat)"
@@ -284,23 +379,43 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             ? "Tendenza Crescente (Sharp)"
             : "Intonazione Centrata";
 
-        const res = await fetch("/api/vocal-coach/analyze", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            exerciseTitle: selectedExercise.title,
-            voiceType: currentRegister.name,
-            accuracyPercent: acc,
-            avgCentsDeviation: avgCents,
-            stabilityPercent: stab,
-            tendency,
-            criticalNotes: Array.from(missedMidis),
-            audioBase64,
-            audioMimeType,
-          }),
-        });
-
-        const data: AiAnalysisResult = await res.json();
+        let data: AiAnalysisResult;
+        try {
+          const res = await fetch("/api/vocal-coach/analyze", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              exerciseTitle: selectedExercise.title,
+              voiceType: currentRegister.name,
+              accuracyPercent: acc,
+              avgCentsDeviation: avgCents,
+              stabilityPercent: stab,
+              tendency: `${tendency} · voce rilevata nel ${coverage}% dell'esercizio`,
+              criticalNotes: Array.from(missedMidis),
+              audioBase64,
+              audioMimeType,
+            }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          data = await res.json();
+        } catch (aiErr) {
+          // The coach is unavailable, but the measurement is real: keep it and save it anyway.
+          console.error("AI coach unavailable, saving measured session only:", aiErr);
+          data = {
+            valutazioneSintetica: `Sessione misurata: accuratezza ${acc}%, stabilità ${stab}%, scarto medio ${avgCents > 0 ? "+" : ""}${avgCents} cent.`,
+            diagnosiIntonazione: `${tendency}. Voce rilevata nel ${coverage}% dell'esercizio.${missedMidis.size > 0 ? ` Note fuori tolleranza: ${Array.from(missedMidis).join(", ")}.` : ""}`,
+            consiglioAnatomico:
+              "Il Maestro AI non è raggiungibile in questo momento: nessun consiglio personalizzato disponibile.",
+            esercizioCorrettivo: {
+              titolo: "Ripeti il vocalizzo",
+              istruzioni: "Riprova più tardi per ricevere la diagnosi del Maestro AI.",
+              obiettivo: "—",
+            },
+            messaggioVocale: `Accuratezza ${acc} per cento, stabilità ${stab} per cento.`,
+            isFallback: true,
+          };
+        }
+        if (!isMountedRef.current) return;
         setAiResult(data);
         onSaveAnalysis(
           data,
@@ -308,18 +423,16 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
           selectedExercise.title,
           stab,
           avgCents,
-          selectedExercise.category
+          selectedExercise.category,
+          durationMin
         );
       } catch (err) {
         console.error("Failed to analyze vocal session:", err);
       } finally {
-        setIsAnalyzing(false);
+        if (isMountedRef.current) setIsAnalyzing(false);
       }
     },
     [
-      sessionAccuracy,
-      avgCentsSession,
-      sessionStability,
       selectedExercise.title,
       selectedExercise.category,
       currentRegister.name,
@@ -343,12 +456,17 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
       return;
     }
 
-    // If in mic mode and mic isn't started yet, try starting it or gracefully use simulator
+    // In mic mode the exercise only starts once the microphone is really live
     if (inputMode === "mic" && !micActive) {
-      await startMicrophone();
+      const ok = await startMicrophone();
+      if (!ok) return;
     }
 
+    discardRecorder();
+    sessionSourceRef.current = inputMode;
     telemetryRef.current = [];
+    guideMaskUntilMsRef.current = 0;
+    resetSessionMetrics();
     setAiResult(null);
     lastStepPlayedRef.current = -1;
     startTimeMsRef.current = performance.now();
@@ -357,8 +475,8 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
     setIsRunning(true);
     isRunningRef.current = true;
 
-    // Optional mic recording for multimodal Gemini coaching
-    if (micStreamRef.current && typeof MediaRecorder !== "undefined") {
+    // Optional mic recording for multimodal Gemini coaching (real mic sessions only)
+    if (inputMode === "mic" && micStreamRef.current && typeof MediaRecorder !== "undefined") {
       try {
         recordedChunksRef.current = [];
         const recorder = new MediaRecorder(micStreamRef.current);
@@ -366,6 +484,8 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
           if (e.data.size > 0) recordedChunksRef.current.push(e.data);
         };
         recorder.onstop = () => {
+          mediaRecorderRef.current = null;
+          if (!isMountedRef.current) return;
           const blob = new Blob(recordedChunksRef.current, { type: "audio/webm" });
           requestAiAnalysis(blob);
         };
@@ -378,13 +498,13 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
   };
 
   const resetExercise = () => {
+    discardRecorder();
     setIsRunning(false);
     isRunningRef.current = false;
     setElapsedBeats(0);
     setCurrentStepIndex(0);
     telemetryRef.current = [];
-    setSessionAccuracy(0);
-    setAvgCentsSession(0);
+    resetSessionMetrics();
     setAiResult(null);
   };
 
@@ -429,11 +549,18 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             lastStepPlayedRef.current = foundStep.index;
             if (guideVolume > 0) {
               const stepDurationSec = foundStep.durationBeats / beatsPerSec;
+              const pianoSec = Math.min(1.4, stepDurationSec * 0.9);
               studioAudio.playPianoNote(
                 foundStep.targetMidi,
-                Math.min(1.4, stepDurationSec * 0.9),
+                pianoSec,
                 (guideVolume / 100) * 0.45
               );
+              // Without headphones the piano (exactly on target) leaks into the mic:
+              // skip scoring while it sounds, but always leave the second half of the step measurable.
+              if (!usingHeadphonesRef.current) {
+                const maskSec = Math.min(pianoSec + 0.12, stepDurationSec * 0.5);
+                guideMaskUntilMsRef.current = nowMs + maskSec * 1000;
+              }
             }
           }
         }
@@ -505,8 +632,30 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
         setLiveRms(0);
       }
 
-      // Record telemetry point if exercise is running
-      if (isRunningRef.current && activeStep) {
+      // Rolling live buffer for vibrato analysis (works with or without a running exercise)
+      liveVibratoBufRef.current.push({ timestamp: nowMs, detectedMidiFloat: midiFloat });
+      while (
+        liveVibratoBufRef.current.length > 0 &&
+        nowMs - liveVibratoBufRef.current[0].timestamp > 1500
+      ) {
+        liveVibratoBufRef.current.shift();
+      }
+      frameCounterRef.current += 1;
+      if (frameCounterRef.current % 10 === 0) {
+        const recent = liveVibratoBufRef.current;
+        const voicedRecent = recent.filter((p) => p.detectedMidiFloat !== null).length;
+        // Only analyse a held tone: mostly voiced frames in the last ~1.5 s
+        setVibratoInfo(
+          voicedRecent >= 14 && voicedRecent >= recent.length * 0.7
+            ? analyzeVibratoFromPoints(recent)
+            : null
+        );
+      }
+
+      // Record telemetry point if exercise is running (skip frames masked by the guide piano)
+      const maskedByGuide =
+        inputModeRef.current === "mic" && nowMs < guideMaskUntilMsRef.current;
+      if (isRunningRef.current && activeStep && !maskedByGuide) {
         telemetryRef.current.push({
           timestamp: nowMs,
           elapsedSec: currentBeat / beatsPerSec,
@@ -519,16 +668,19 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
           isOnTarget,
         });
 
-        // Update live running accuracy every ~15 frames
+        // Update live running accuracy & coverage every ~12 frames
         if (telemetryRef.current.length % 12 === 0) {
           const validPts = telemetryRef.current.filter(
             (p) => p.detectedMidiFloat !== null
+          );
+          setSessionCoverage(
+            Math.round((validPts.length / telemetryRef.current.length) * 100)
           );
           if (validPts.length > 0) {
             const hits = validPts.filter((p) => p.isOnTarget).length;
             setSessionAccuracy(Math.round((hits / validPts.length) * 100));
             const avgC =
-              validPts.reduce((s, p) => s + (p.centsOff || 0), 0) /
+              validPts.reduce((s, p) => s + (p.centsOff ?? 0), 0) /
               validPts.length;
             setAvgCentsSession(Math.round(avgC));
           }
@@ -719,9 +871,22 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
         colorClass: "text-slate-400 border-slate-700 bg-slate-800/60",
       };
     }
+    if (!isRunning) {
+      // Free tuner: cents are relative to the nearest semitone, not to the exercise target
+      if (Math.abs(liveCents) <= toleranceCents) {
+        return {
+          label: "● CENTRATA (NOTA PIÙ VICINA)",
+          colorClass: "text-sky-300 border-sky-500/40 bg-sky-950/60",
+        };
+      }
+      return {
+        label: liveCents > 0 ? "▲ ALTA RISPETTO ALLA NOTA" : "▼ BASSA RISPETTO ALLA NOTA",
+        colorClass: "text-slate-300 border-slate-600 bg-slate-800/60",
+      };
+    }
     if (Math.abs(liveCents) <= toleranceCents) {
       return {
-        label: "● INTONATO (NOMINALE)",
+        label: "● INTONATO SUL TARGET",
         colorClass: "text-emerald-300 border-emerald-500/40 bg-emerald-950/60",
       };
     }
@@ -785,7 +950,10 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => setInputMode("simulator")}
+                onClick={() => {
+                  setMicError(null);
+                  setInputMode("simulator");
+                }}
                 className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
                   inputMode === "simulator"
                     ? "bg-sky-600 text-white"
@@ -793,7 +961,7 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
                 }`}
               >
                 <Piano className="w-3.5 h-3.5" />
-                <span>Simulatore & Tastiera</span>
+                <span>Demo Simulata & Tastiera</span>
               </button>
             </div>
           </div>
@@ -814,10 +982,38 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             </div>
           )}
 
+          {inputMode === "simulator" && (
+            <div className="flex items-center gap-2 px-3.5 py-2.5 rounded-lg bg-slate-800/70 border border-slate-700 text-xs text-slate-300">
+              <Piano className="w-4 h-4 text-sky-400 shrink-0" />
+              <span>
+                Demo simulata: le note sono generate dal simulatore (o dalla tastiera), non dalla tua
+                voce. Le esecuzioni demo non vengono salvate nei progressi né valutate dal Maestro AI.
+              </span>
+            </div>
+          )}
+
+          {inputMode === "mic" && (
+            <label className="flex flex-wrap items-center gap-2 px-3.5 py-2 rounded-lg bg-slate-950/70 border border-slate-800 text-[11px] text-slate-400 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={usingHeadphones}
+                onChange={(e) => setUsingHeadphones(e.target.checked)}
+                className="accent-sky-500"
+              />
+              <Headphones className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+              <span>
+                Uso le cuffie. Consigliate: senza cuffie il pianoforte guida rientra nel microfono,
+                quindi mentre suona la nota guida la tua intonazione non viene conteggiata.
+              </span>
+            </label>
+          )}
+
           {/* Live Telemetry Readout Strip (Tabular Numerals + Explicit State Labels) */}
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
             <div className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-3">
-              <div className="text-xs text-slate-400">Nota Target / Cantata</div>
+              <div className="text-xs text-slate-400">
+                {isRunning ? "Nota Target / Cantata" : "Prima Nota Esercizio / Cantata"}
+              </div>
               <div className="mt-1 flex items-baseline justify-between gap-2 font-mono tabular-nums">
                 <span className="text-lg font-semibold text-sky-400">
                   {activeStepObj ? activeStepObj.noteInfo.noteIt : "Do4"}
@@ -836,7 +1032,7 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             <div className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-3">
               <div className="text-xs text-slate-400">Frequenza Rilevata</div>
               <div className="mt-1 text-lg font-semibold text-slate-100 font-mono tabular-nums">
-                {liveFreq !== null ? `${liveFreq.toFixed(1)} Hz` : "0.0 Hz"}
+                {liveFreq !== null ? `${liveFreq.toFixed(1)} Hz` : "— Hz"}
               </div>
               <div className="text-[11px] text-slate-400 mt-0.5 font-mono tabular-nums">
                 Livello RMS: {Math.min(100, Math.round(liveRms * 320))}%
@@ -844,11 +1040,13 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             </div>
 
             <div className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-3">
-              <div className="text-xs text-slate-400">Scarto Intonazione</div>
+              <div className="text-xs text-slate-400">
+                {isRunning ? "Scarto dal Target" : "Accordatore libero · nota più vicina"}
+              </div>
               <div className="mt-1 text-lg font-semibold text-slate-100 font-mono tabular-nums">
                 {liveCents !== null
                   ? `${liveCents > 0 ? `+${liveCents}` : liveCents} cent`
-                  : "0 cent"}
+                  : "— cent"}
               </div>
               <div className="mt-1">
                 <span
@@ -862,21 +1060,33 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             <div className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-3">
               <div className="text-xs text-slate-400">Analisi Vibrato</div>
               <div className="mt-1 text-lg font-semibold text-sky-300 font-mono tabular-nums">
-                {vibratoInfo.rateHz > 0 ? `${vibratoInfo.rateHz} Hz` : "Dritta"} · ±
-                {vibratoInfo.extentCents}c
+                {vibratoInfo && vibratoInfo.statusLabel.indexOf("ATTESA") === -1
+                  ? `${vibratoInfo.rateHz > 0 ? `${vibratoInfo.rateHz} Hz` : "Dritta"} · ±${vibratoInfo.extentCents}c`
+                  : "—"}
               </div>
-              <div className="text-[10px] text-emerald-400 mt-0.5 font-mono font-semibold">
-                {vibratoInfo.statusLabel}
+              <div
+                className={`text-[10px] mt-0.5 font-mono font-semibold ${
+                  vibratoInfo?.isNominal ? "text-emerald-400" : "text-slate-400"
+                }`}
+              >
+                {vibratoInfo ? vibratoInfo.statusLabel : "○ IN ATTESA (TIENI UNA NOTA)"}
               </div>
             </div>
 
             <div className="bg-slate-950/80 border border-slate-800/80 rounded-lg p-3">
               <div className="text-xs text-slate-400">Accuratezza Sessione</div>
               <div className="mt-1 text-lg font-semibold text-emerald-400 font-mono tabular-nums">
-                {sessionAccuracy}%
+                {sessionAccuracy !== null ? `${sessionAccuracy}%` : "—"}
               </div>
               <div className="text-[11px] text-slate-400 mt-0.5 font-mono tabular-nums">
-                Media: {avgCentsSession > 0 ? `+${avgCentsSession}` : avgCentsSession} cent
+                Media:{" "}
+                {avgCentsSession !== null
+                  ? `${avgCentsSession > 0 ? `+${avgCentsSession}` : avgCentsSession} cent`
+                  : "—"}
+              </div>
+              <div className="text-[11px] text-slate-400 font-mono tabular-nums">
+                Voce rilevata: {sessionCoverage !== null ? `${sessionCoverage}%` : "—"}
+                {sessionStability !== null ? ` · Stabilità ${sessionStability}%` : ""}
               </div>
             </div>
           </div>
@@ -984,7 +1194,7 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
             <button
               type="button"
               onClick={() => requestAiAnalysis()}
-              disabled={isAnalyzing}
+              disabled={isAnalyzing || isRunning}
               className="flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white transition-colors whitespace-nowrap shrink-0"
             >
               <Sparkles className="w-3.5 h-3.5" />
@@ -993,6 +1203,13 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
               </span>
             </button>
           </div>
+
+          {analysisNotice && (
+            <div className="flex items-start gap-2 px-3.5 py-2.5 rounded-lg bg-slate-800/70 border border-slate-700 text-xs text-slate-200">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <span>{analysisNotice}</span>
+            </div>
+          )}
 
           {/* Interactive Reference Keyboard Strip (Click/Hold to Play & Simulate Singing) */}
           <div className="pt-2 border-t border-slate-800/80">
@@ -1082,6 +1299,8 @@ export const PitchStudio: React.FC<PitchStudioProps> = ({
                 </span>
               </button>
             </div>
+
+            <AiFallbackNotice show={aiResult.isFallback} />
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
               <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-3.5">

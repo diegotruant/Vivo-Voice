@@ -95,6 +95,19 @@ export interface VocalSessionRecord {
   coachNote?: string;
 }
 
+/** Training modules a song-analysis weak point can link to (must match App tab ids). */
+export const TRAINING_MODULE_IDS = [
+  "diaframma",
+  "riscaldamento",
+  "solfeggio",
+  "palestra",
+] as const;
+export type TrainingModuleId = (typeof TRAINING_MODULE_IDS)[number];
+
+export function isTrainingModuleId(v: unknown): v is TrainingModuleId {
+  return typeof v === "string" && (TRAINING_MODULE_IDS as readonly string[]).includes(v);
+}
+
 export interface SongDiagnosticResponse {
   sintesiPerformance: string;
   puntiDiForza: Array<{
@@ -102,17 +115,17 @@ export interface SongDiagnosticResponse {
     dettaglio: string;
   }>;
   puntiDeboliDaAllenare: Array<{
-    area: string;
+    problema: string;
     causaFisiologica: string;
     esercizioConsigliato: string;
-    moduloApp: "diaframma" | "riscaldamento" | "solfeggio" | "palestra";
+    moduloApp: TrainingModuleId;
   }>;
   presetCorrezioneAi: {
-    pitchCorrectionAmount: number;
-    formantSquilloBoostDb: number;
+    pitchCorrectionPercent: number;
+    eqPresenceDb: number;
     compressionRatio: number;
     reverbWetPercent: number;
-    spiegazioneMastering: string;
+    motivazioneSoundEngineer: string;
   };
   messaggioVocaleCoach: string;
   isFallback?: boolean;

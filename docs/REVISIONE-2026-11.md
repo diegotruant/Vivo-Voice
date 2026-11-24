@@ -47,3 +47,11 @@ Rischi: aspettative di precisione, latenza audio sul web (specie iOS/Safari), pr
 quando l'audio va a Gemini, credibilità del feedback LLM se non ancorato a misure reali.
 Opportunità: conservatori, cori e insegnanti italiani; pannello per insegnanti; possibile collaborazione con
 l'ambito accademico (es. VoiceWorm, Università di Bologna).
+
+## Stato correzioni
+
+- **Fase 1 — onestà dei dati: completata.** Nessun punteggio inventato o forzato in un intervallo; "non misurato" quando
+  manca la misura; cronologia progressi vuota all'inizio; simulatore mai salvato come reale; vibrato della Palestra
+  misurato davvero; modelli simulati dichiarati; avviso visibile quando il coach AI risponde con un testo di riserva;
+  contratto client/server dello Studio Brani allineato; contatore cicli della Respirazione corretto.
+- Fase 2 (bug bloccanti), Fase 3 (misure reali), Fase 4 (produzione e sicurezza): da fare.

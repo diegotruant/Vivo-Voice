@@ -18,6 +18,53 @@ const ai = new GoogleGenAI({
   },
 });
 
+const GEMINI_KEY = process.env.GEMINI_API_KEY;
+if (!GEMINI_KEY || GEMINI_KEY === "MY_GEMINI_API_KEY" || GEMINI_KEY.trim() === "") {
+  console.warn(
+    "\n⚠️  GEMINI_API_KEY mancante o segnaposto: il Coach AI non è attivo.\n" +
+      "   Gli endpoint /api/vocal-coach/* risponderanno con consigli generici offline (isFallback: true).\n" +
+      "   Imposta GEMINI_API_KEY nel file .env per abilitare l'analisi AI.\n"
+  );
+}
+
+/** Rule appended to every coach prompt: feedback must be grounded in the measurements sent. */
+const MEASUREMENT_RULE =
+  "REGOLA FONDAMENTALE: basa il feedback esclusivamente sulle misure fornite. Non inventare numeri, " +
+  "percentuali, centesimi, note o problemi non presenti nei dati. Se una misura è indicata come NON MISURATA, " +
+  "dichiara che non è stata misurata e non fare ipotesi su di essa. Non fornire diagnosi mediche.";
+
+const NOT_MEASURED = "NON MISURATO (non stimarlo né inventarlo)";
+
+function isNum(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+/** Formats a numeric measurement for a prompt, or marks it as not measured. Never emits "undefined". */
+function fmtMeasure(v: unknown, unit: string, signed = false): string {
+  if (!isNum(v)) return NOT_MEASURED;
+  return `${signed && v > 0 ? "+" : ""}${v}${unit}`;
+}
+
+function fmtText(v: unknown, fallback = NOT_MEASURED): string {
+  return typeof v === "string" && v.trim() !== "" ? v.trim().slice(0, 300) : fallback;
+}
+
+/**
+ * Parses the model's JSON text and checks the required top-level fields.
+ * Throws (→ endpoint fallback) when the response is empty, malformed or incomplete,
+ * so the client never receives `{}`.
+ */
+function parseModelJson(text: string | undefined, required: string[]): Record<string, unknown> {
+  if (!text) throw new Error("Risposta vuota dal modello");
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== "object") throw new Error("Risposta non valida dal modello");
+  const missing = required.filter((k) => parsed[k] === undefined || parsed[k] === null);
+  if (missing.length > 0) throw new Error(`Campi mancanti nella risposta: ${missing.join(", ")}`);
+  return parsed;
+}
+
+const TRAINING_MODULE_IDS = ["diaframma", "riscaldamento", "solfeggio", "palestra"];
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -41,15 +88,17 @@ async function startServer() {
 
       const promptText = `Sei un Maestro di Canto e Vocal Coach italiano di livello conservatoriale e moderno.
 Analizza la seguente sessione di allenamento vocale eseguita dallo studente:
-- Esercizio svolto: ${exerciseTitle || "Vocalizzo di intonazione"}
-- Registro vocale impostato: ${voiceType || "Tenore / Mezzosoprano"}
-- Accuratezza media intonazione: ${accuracyPercent ?? 82}%
-- Deviazione media in centesimi di semitono: ${avgCentsDeviation > 0 ? `+${avgCentsDeviation}` : avgCentsDeviation} cent (${tendency || "Stabile"})
-- Stabilità di emissione e tenuta del fiato: ${stabilityPercent ?? 85}%
+- Esercizio svolto: ${fmtText(exerciseTitle, "Vocalizzo di intonazione")}
+- Registro vocale impostato: ${fmtText(voiceType, "non specificato")}
+- Accuratezza media intonazione: ${fmtMeasure(accuracyPercent, "%")}
+- Deviazione media in centesimi di semitono: ${fmtMeasure(avgCentsDeviation, " cent", true)}${
+        isNum(avgCentsDeviation) && typeof tendency === "string" && tendency ? ` (${tendency})` : ""
+      }
+- Stabilità di emissione e tenuta del fiato: ${fmtMeasure(stabilityPercent, "%")}
 - Note con maggiore difficoltà: ${
         Array.isArray(criticalNotes) && criticalNotes.length > 0
-          ? criticalNotes.join(", ")
-          : "Passaggio superiore"
+          ? criticalNotes.slice(0, 20).join(", ")
+          : "nessuna nota critica rilevata"
       }
 
 Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, strutturata esattamente secondo lo schema JSON richiesto.`;
@@ -70,7 +119,8 @@ Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, s
         contents: { parts },
         config: {
           systemInstruction:
-            "Rispondi sempre in italiano come un esperto Vocal Coach. Fornisci indicazioni pratiche e fisiologiche su appoggio diaframmatico, posizione della laringe, morbidezza mandibolare, velo palatino e risonanza.",
+            "Rispondi sempre in italiano come un esperto Vocal Coach. Fornisci indicazioni pratiche e fisiologiche su appoggio diaframmatico, posizione della laringe, morbidezza mandibolare, velo palatino e risonanza. " +
+            MEASUREMENT_RULE,
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -115,21 +165,29 @@ Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, s
         },
       });
 
-      const rawText = response.text || "{}";
-      const parsed = JSON.parse(rawText);
-      res.json(parsed);
+      res.json(
+        parseModelJson(response.text, [
+          "valutazioneSintetica",
+          "diagnosiIntonazione",
+          "consiglioAnatomico",
+          "esercizioCorrettivo",
+          "messaggioVocale",
+        ])
+      );
     } catch (error: any) {
       console.error("Error in /api/vocal-coach/analyze:", error);
-      // Graceful structured fallback if API quota or network fails, while keeping error info transparent
+      // Static offline fallback (isFallback: true): generic advice, only echoing the client's own measured value
+      const dev = req.body?.avgCentsDeviation;
       res.status(200).json({
         valutazioneSintetica:
-          "Buona tenuta generale sull'esercizio; attenzione a mantenere costante la pressione sottoglottica nei cambi di nota.",
-        diagnosiIntonazione:
-          req.body.avgCentsDeviation < -8
-            ? `Tendenza lievemente calante (${req.body.avgCentsDeviation} cent): spesso causata da un calo del sostegno intercostale a fine frase o dal velo palatino troppo basso.`
-            : req.body.avgCentsDeviation > 8
-            ? `Tendenza lievemente crescente (+${req.body.avgCentsDeviation} cent): attenzione a non spingere troppa aria sulla laringe durante l'ascesa.`
-            : "Intonazione ben centrata nel corridoio armonico con ottima corrispondenza di frequenza.",
+          "Analisi AI non disponibile in questo momento. Di seguito un consiglio generale valido per questo tipo di esercizio.",
+        diagnosiIntonazione: !isNum(dev)
+          ? "Intonazione non misurata in questa sessione."
+          : dev < -8
+          ? `Lo scarto medio misurato è ${dev} cent (tendenza calante): spesso dipende da un calo del sostegno a fine frase o dal velo palatino troppo basso.`
+          : dev > 8
+          ? `Lo scarto medio misurato è +${dev} cent (tendenza crescente): attenzione a non spingere troppa aria sulla laringe durante l'ascesa.`
+          : `Lo scarto medio misurato è ${dev > 0 ? "+" : ""}${dev} cent: intonazione media centrata.`,
         consiglioAnatomico:
           "Mantieni le costole inferiori espanse durante l'attacco del suono (appoggio) e immagina uno spazio verticale morbido nel retrobocca, come l'inizio di uno sbadiglio silenzioso.",
         esercizioCorrettivo: {
@@ -140,7 +198,7 @@ Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, s
             "Scollegare la tensione laringea dall'altezza tonale ed equilibrare la pressione sottoglottica.",
         },
         messaggioVocale:
-          "Ottimo lavoro! Ho notato una buona presenza vocale. Nel prossimo passaggio concentra l'attenzione sull'appoggio intercostale prima di attaccare la nota più acuta, lasciando la gola libera e rilassata.",
+          "Il coach AI non è disponibile in questo momento. Un consiglio generale: prima di attaccare la nota più acuta prepara l'appoggio intercostale e lascia la gola libera e rilassata.",
         isFallback: true,
       });
     }
@@ -157,14 +215,20 @@ Fornisci una valutazione tecnica rigorosa ma incoraggiante in lingua italiana, s
       const response = await ai.models.generateContent({
         model: "gemini-3.8-flash",
         contents: `Profilo dello studente:
-- Registro: ${voiceType || "Non specificato"}
-- Estensione rilevata: ${lowestNote || "C3"} – ${highestNote || "G4"}
-- Accuratezza recente: ${recentAccuracy ? `${recentAccuracy}%` : "In fase di calibrazione"}
+- Registro: ${fmtText(voiceType, "non specificato")}
+- Estensione: ${
+          typeof lowestNote === "string" && typeof highestNote === "string" && lowestNote && highestNote
+            ? `${lowestNote} – ${highestNote}`
+            : NOT_MEASURED
+        }
+- Accuratezza recente: ${fmtMeasure(recentAccuracy, "%")}
 
-Domanda dello studente: "${question}"`,
+Domanda dello studente: "${question.slice(0, 2000)}"`,
         config: {
           systemInstruction:
-            "Sei un Maestro di Canto professionista. Rispondi in italiano con precisione didattica, spiegando: 1) Perché accade il fenomeno vocale descritto, 2) Cosa fare fisicamente (respirazione, laringe, risonanza), 3) Un esercizio immediato passo-passo da provare subito.",
+            "Sei un Maestro di Canto professionista. Rispondi in italiano con precisione didattica, spiegando: 1) Perché accade il fenomeno vocale descritto, 2) Cosa fare fisicamente (respirazione, laringe, risonanza), 3) Un esercizio immediato passo-passo da provare subito. " +
+            MEASUREMENT_RULE +
+            " Se lo studente descrive dolore, raucedine persistente o perdita di voce, consiglia di rivolgersi a un foniatra o otorinolaringoiatra.",
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -199,12 +263,20 @@ Domanda dello studente: "${question}"`,
         },
       });
 
-      const parsed = JSON.parse(response.text || "{}");
+      const parsed = parseModelJson(response.text, [
+        "titoloRisposta",
+        "spiegazioneFisiologica",
+        "azionePratica",
+        "routineConsigliata",
+        "sintesiVocale",
+      ]);
+      if (!Array.isArray(parsed.routineConsigliata)) parsed.routineConsigliata = [];
       res.json(parsed);
     } catch (error: any) {
       console.error("Error in /api/vocal-coach/ask:", error);
       res.status(200).json({
-        titoloRisposta: "Controllo del Passaggio di Registro e Libertà Laringea",
+        titoloRisposta:
+          "Coach AI non disponibile — consiglio generale sul passaggio di registro e la libertà laringea",
         spiegazioneFisiologica:
           "Quando saliamo verso le note acute, i muscoli costrittori esterni del collo tendono ad attivarsi se il supporto del fiato cede. La laringe sale eccessivamente riducendo lo spazio faringeo.",
         azionePratica:
@@ -294,14 +366,16 @@ Domanda dello studente: "${question}"`,
 
       const response = await ai.models.generateContent({
         model: "gemini-3.8-flash",
-        contents: `Modulo didattico: ${moduleType}
-Esercizio eseguito: ${exerciseName}
-Registro allievo: ${voiceType || "Tenore / Mezzosoprano"}
-Risultato misurato: ${scorePercent}%
-Dettagli tecnici: ${details || "Sessione guidata completata"}`,
+        contents: `Modulo didattico: ${fmtText(moduleType, "lezione di canto")}
+Esercizio eseguito: ${fmtText(exerciseName, "non specificato")}
+Registro allievo: ${fmtText(voiceType, "non specificato")}
+Risultato misurato: ${fmtMeasure(scorePercent, "%")}
+Dettagli tecnici: ${typeof details === "string" && details ? details.slice(0, 1500) : "nessun dettaglio fornito"}`,
         config: {
           systemInstruction:
-            "Sei un Maestro di Canto e Solfeggio Cantato italiano. Guida l'allievo come in una vera lezione individuale in studio: spiega cosa ha fatto bene, correggi l'errore specifico (es. pre-fonazione mentale della nota nel solfeggio, divisione ritmica del quarto, o tenuta diaframmatica nella sibilante) e assegna il passo successivo.",
+            "Sei un Maestro di Canto e Solfeggio Cantato italiano. Guida l'allievo come in una vera lezione individuale in studio: spiega cosa ha fatto bene, correggi l'errore specifico (es. pre-fonazione mentale della nota nel solfeggio, divisione ritmica del quarto, o tenuta diaframmatica nella sibilante) e assegna il passo successivo. " +
+            MEASUREMENT_RULE +
+            " Se il risultato non è stato misurato, non lodare né criticare l'esecuzione: dai indicazioni su come eseguire bene l'esercizio.",
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -324,62 +398,94 @@ Dettagli tecnici: ${details || "Sessione guidata completata"}`,
         },
       });
 
-      const parsed = JSON.parse(response.text || "{}");
-      res.json(parsed);
+      res.json(
+        parseModelJson(response.text, [
+          "feedbackMaestro",
+          "correzioneTecnica",
+          "prossimoPasso",
+          "fraseVocaleCoach",
+        ])
+      );
     } catch (error: any) {
       console.error("Error in /api/vocal-coach/lesson-coach:", error);
-      res.status(200).json({
-        feedbackMaestro:
-          "Buona concentrazione sulla lettura e sull'emissione. Stai sviluppando il collegamento tra l'orecchio interno (pre-fonazione) e il gesto vocale.",
-        correzioneTecnica:
-          "Nel solfeggio cantato non cercare la nota 'scivolando' dal basso: immagina il centro esatto della nota durante il movimento di levare della mano, appoggiando il fiato un istante prima di pronunciare il nome della nota.",
-        prossimoPasso:
-          "Ripeti la lettura a velocità moderata respirando silenziosamente sul quarto movimento prima dell'attacco sul battere.",
-        fraseVocaleCoach:
-          "Bravo! Ricorda che il solfeggio cantato serve a pensare la nota prima ancora di emetterla. Respira sul levare, immagina il suono già alto e attacca in modo pulito sul battere.",
-        isFallback: true,
-      });
+      // Static offline fallback, chosen by module so the tip matches the exercise just done
+      const mod = String(req.body?.moduleType || "").toLowerCase();
+      const intro = "Coach AI non disponibile: ecco un consiglio generale per questo esercizio.";
+      const fallback = /respir|diaframm|appoggio/.test(mod)
+        ? {
+            correzioneTecnica:
+              "Durante la sibilante 'SSS' mantieni le costole inferiori aperte il più a lungo possibile: il flusso deve restare uguale dall'inizio alla fine, senza spinte né cali improvvisi.",
+            prossimoPasso:
+              "Ripeti 3 cicli completi a ritmo comodo, allungando l'espirazione di un secondo solo quando il suono resta perfettamente costante.",
+            fraseVocaleCoach:
+              "Il coach AI non è disponibile. Ricorda: costole aperte, spalle ferme e un filo d'aria costante dall'inizio alla fine della sibilante.",
+          }
+        : /riscald|sovte|fry|trill/.test(mod)
+        ? {
+            correzioneTecnica:
+              "Negli esercizi SOVTE (lip trill, cannuccia, 'NG') tieni il volume moderato: il riscaldamento deve preparare la voce senza affaticarla. Se senti sforzo in gola, abbassa volume e altezza.",
+            prossimoPasso:
+              "Completa le fasi in ordine con le pause indicate, poi passa a un vocalizzo leggero nella Palestra Vocale.",
+            fraseVocaleCoach:
+              "Il coach AI non è disponibile. Riscalda la voce con calma e a volume moderato: niente spinta, labbra e gola morbide.",
+          }
+        : {
+            correzioneTecnica:
+              "Nel solfeggio cantato non cercare la nota 'scivolando' dal basso: immagina il centro esatto della nota prima di attaccarla, appoggiando il fiato un istante prima di pronunciarne il nome.",
+            prossimoPasso:
+              "Ripeti la lettura a velocità moderata respirando silenziosamente sul quarto movimento prima dell'attacco sul battere.",
+            fraseVocaleCoach:
+              "Il coach AI non è disponibile. Ricorda di pensare la nota prima di emetterla: respira sul levare e attacca in modo pulito sul battere.",
+          };
+      res.status(200).json({ feedbackMaestro: intro, ...fallback, isFallback: true });
     }
   });
 
   // 5. Song Vocal Track Analysis (Strengths, Weaknesses, Training Plan & AI Vocal Processing Preset)
   app.post("/api/vocal-coach/song-analyze", async (req, res) => {
     try {
+      // Field names match exactly what SongStudioDaw sends
       const {
         songTitle,
-        musicalKey,
         voiceType,
-        overallAccuracy,
-        avgCents,
-        stabilityScore,
+        accuracyPercent,
+        stabilityPercent,
+        avgCentsDeviation,
         vibratoRateHz,
-        highNoteMidi,
+        vibratoExtentCents,
+        lowestSungNote,
+        highestSungNote,
         weakPassages,
         audioBase64,
         audioMimeType,
       } = req.body;
 
       const promptText = `Sei un Vocal Coach e Produttore Vocale di studio.
-L'allievo ha appena registrato una traccia vocale cantando sopra il brano "${songTitle || "Base Strumentale"}".
-Dati telemetrici rilevati sulla traccia vocale:
-- Tonalità impostata: ${musicalKey || "Do Maggiore / La Minore"}
-- Registro vocale: ${voiceType || "Tenore / Mezzosoprano"}
-- Accuratezza media di intonazione: ${overallAccuracy ?? 84}%
-- Scarto medio in centesimi: ${avgCents ?? -5} cent
-- Stabilità dinamica e tenuta fiato: ${stabilityScore ?? 82}%
-- Frequenza media vibrato: ${vibratoRateHz ?? 5.6} Hz
-- Nota più acuta toccata: ${highNoteMidi || "Sol4"}
+L'allievo ha appena registrato una traccia vocale cantando sopra il brano "${fmtText(songTitle, "Base Strumentale").slice(0, 120)}".
+Dati telemetrici misurati sulla traccia vocale:
+- Registro vocale: ${fmtText(voiceType, "non specificato")}
+- Centratura cromatica (% di istanti entro ±32 cent dal semitono più vicino; NON è il confronto con la melodia del brano): ${fmtMeasure(accuracyPercent, "%")}
+- Scarto medio in centesimi dal semitono più vicino: ${fmtMeasure(avgCentsDeviation, " cent", true)}
+- Stabilità dell'intonazione: ${fmtMeasure(stabilityPercent, "%")}
+- Vibrato: frequenza ${fmtMeasure(vibratoRateHz, " Hz")}, ampiezza ${fmtMeasure(vibratoExtentCents, " cent")}
+- Estensione cantata nel take: ${
+        typeof lowestSungNote === "string" && typeof highestSungNote === "string" && lowestSungNote && highestSungNote
+          ? `${lowestSungNote} – ${highestSungNote}`
+          : NOT_MEASURED
+      }
 - Passaggi critici rilevati con timestamp: ${
         Array.isArray(weakPassages) && weakPassages.length > 0
-          ? JSON.stringify(weakPassages)
-          : "Leggera instabilità sugli acuti finali"
+          ? JSON.stringify(weakPassages.slice(0, 30))
+          : "nessun passaggio critico rilevato"
       }
 
 Restituisci in JSON:
 1. I punti di forza specifici dimostrati nell'interpretazione.
 2. I punti deboli su cui allenarsi (con causa tecnica ed esercizio mirato consigliato).
 3. I parametri ottimali di correzione e mastering AI (quantità pitch-correction, presenza EQ squillo 3kHz, compressione, riverbero) per fondere la voce con gli stem strumentali.
-4. Un commento vocale del Maestro/Produttore da riprodurre via TTS.`;
+4. Un commento vocale del Maestro/Produttore da riprodurre via TTS.
+Per ogni punto debole, "moduloApp" deve essere uno di: diaframma, riscaldamento, solfeggio, palestra.
+Se non ci sono passaggi critici rilevati, non inventarne: indica punti deboli solo se supportati dai dati.`;
 
       const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
       if (audioBase64 && audioMimeType) {
@@ -397,7 +503,8 @@ Restituisci in JSON:
         contents: { parts },
         config: {
           systemInstruction:
-            "Rispondi sempre in italiano come un Vocal Coach ed esperto Sound Engineer vocale. Fornisci un'analisi incoraggiante, concreta e tecnicamente precisa.",
+            "Rispondi sempre in italiano come un Vocal Coach ed esperto Sound Engineer vocale. Fornisci un'analisi incoraggiante, concreta e tecnicamente precisa. " +
+            MEASUREMENT_RULE,
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -422,7 +529,7 @@ Restituisci in JSON:
                     problema: { type: Type.STRING },
                     causaFisiologica: { type: Type.STRING },
                     esercizioConsigliato: { type: Type.STRING },
-                    moduloApp: { type: Type.STRING },
+                    moduloApp: { type: Type.STRING, enum: TRAINING_MODULE_IDS },
                   },
                   required: [
                     "problema",
@@ -462,53 +569,53 @@ Restituisci in JSON:
         },
       });
 
-      const parsed = JSON.parse(response.text || "{}");
+      const parsed = parseModelJson(response.text, [
+        "sintesiPerformance",
+        "puntiDiForza",
+        "puntiDeboliDaAllenare",
+        "presetCorrezioneAi",
+        "messaggioVocaleCoach",
+      ]);
+      if (!Array.isArray(parsed.puntiDiForza)) parsed.puntiDiForza = [];
+      if (!Array.isArray(parsed.puntiDeboliDaAllenare)) parsed.puntiDeboliDaAllenare = [];
+      // Drop links to modules that don't exist in the app
+      parsed.puntiDeboliDaAllenare = (parsed.puntiDeboliDaAllenare as Array<Record<string, unknown>>).map(
+        (p) => (TRAINING_MODULE_IDS.includes(String(p?.moduloApp)) ? p : { ...p, moduloApp: undefined })
+      );
       res.json(parsed);
     } catch (error: any) {
       console.error("Error in /api/vocal-coach/song-analyze:", error);
       res.status(200).json({
         sintesiPerformance:
-          "Buona espressività e intenzione musicale sul brano; il centro vocale è solido nelle strofe con lieve affaticamento nei picchi dinamici.",
-        puntiDiForza: [
-          {
-            titolo: "Timing Ritmico e Attacco Vocale",
-            dettaglio:
-              "Ottima sincronia con il groove della base strumentale e attacchi morbidi senza colpi di glottide.",
-          },
-          {
-            titolo: "Colore Timbrico nel Registro Centrale",
-            dettaglio:
-              "Buona proiezione delle vocali centrali con armonici equilibrati e vibrato naturale a fine frase.",
-          },
-        ],
+          "Coach AI non disponibile: nessuna analisi della tua esecuzione è stata generata. Usa le misure mostrate sopra e i consigli generali qui sotto.",
+        puntiDiForza: [],
         puntiDeboliDaAllenare: [
           {
-            problema: "Lieve calo d'intonazione (-18 cent) sulle note tenute a fine frase",
+            problema: "Consiglio generale: tenuta dell'intonazione a fine frase",
             causaFisiologica:
-              "Perdita anticipata dell'apertura intercostale negli ultimi 2 secondi di emissione.",
+              "Un calo del sostegno costo-diaframmatico negli ultimi secondi della frase tende a far calare l'intonazione.",
             esercizioConsigliato:
-              "Sostenuto Lirico 4-3-14 con verifica microfonica della sibilante 'SSS'",
+              "Sostenuto con sibilante 'SSS' nel modulo Respirazione, poi note tenute nella Palestra Vocale.",
             moduloApp: "diaframma",
           },
           {
-            problema: "Tensione laringea sui salti verso il registro acuto",
+            problema: "Consiglio generale: libertà laringea sui salti verso l'acuto",
             causaFisiologica:
-              "Mancato alleggerimento in voce mista e scarso arrotondamento labiale sul passaggio.",
-            esercizioConsigliato:
-              "Lip Trill su Sirena d'Ottava + Ponte sul Passaggio (1-5-8-5-1)",
+              "Spingere volume sugli acuti alza la laringe e irrigidisce il passaggio di registro.",
+            esercizioConsigliato: "Lip trill su sirena d'ottava nel modulo Riscaldamento.",
             moduloApp: "riscaldamento",
           },
         ],
         presetCorrezioneAi: {
-          pitchCorrectionPercent: 78,
-          eqPresenceDb: 3.2,
-          compressionRatio: 3.5,
-          reverbWetPercent: 22,
+          pitchCorrectionPercent: 70,
+          eqPresenceDb: 3,
+          compressionRatio: 3,
+          reverbWetPercent: 18,
           motivazioneSoundEngineer:
-            "Applicata centratura cromatica morbida al 78% per preservare il vibrato naturale, +3.2 dB a 3 kHz per far emergere lo squillo sopra gli stem strumentali e compressione ottica 3.5:1 per uniformare il volume.",
+            "valori standard (correzione morbida, leggera presenza a 3 kHz, compressione moderata), non calcolati sulla tua traccia.",
         },
         messaggioVocaleCoach:
-          "Complimenti per la registrazione! Hai un bel timbro nel registro centrale. Ho preparato il piano di allenamento sui punti deboli e impostato la catena di correzione AI per fondere la tua voce con gli stem del brano.",
+          "Il coach AI non è disponibile in questo momento. Puoi comunque riascoltare il tuo take, regolare la correzione e allenarti con i moduli consigliati.",
         isFallback: true,
       });
     }

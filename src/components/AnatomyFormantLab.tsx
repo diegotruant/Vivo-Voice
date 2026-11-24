@@ -11,7 +11,8 @@ import {
   Mic,
   MicOff,
 } from "lucide-react";
-import { studioAudio, formatMidiNote } from "../utils/audioEngine";
+import { studioAudio, formatMidiNote, VOICE_REGISTERS } from "../utils/audioEngine";
+import { AiFallbackNotice } from "./AiFallbackNotice";
 import {
   AiConsultationResponse,
   AiAnalysisResult,
@@ -104,7 +105,8 @@ interface AnatomyFormantLabProps {
   selectedRegisterId: VoiceRegisterId;
   lowNoteLabel: string;
   highNoteLabel: string;
-  recentAccuracy: number;
+  /** Accuracy of the latest real Palestra session, or null when none was recorded */
+  recentAccuracy: number | null;
   lastAnalysis: AiAnalysisResult | null;
   lastExerciseTitle: string;
   onPlayCoachVoice: (text: string) => void;
@@ -149,7 +151,11 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
   // VoceVista-style Real-Time Microphone FFT Spectrum Overlay & Squillo 3kHz Detector
   const [micFftActive, setMicFftActive] = useState<boolean>(false);
   const [micFftPath, setMicFftPath] = useState<string>("");
-  const [squilloPercent, setSquilloPercent] = useState<number>(0);
+  // Singer's-formant index: energy 2–4 kHz vs 0–2 kHz in dB (null when no voice is detected)
+  const [squilloDb, setSquilloDb] = useState<number | null>(null);
+  const [micError, setMicError] = useState<string | null>(null);
+  const micPendingRef = useRef<boolean>(false);
+  const mountedRef = useRef<boolean>(true);
   const micStreamRef = useRef<MediaStream | null>(null);
   const micCtxRef = useRef<AudioContext | null>(null);
   const micRafRef = useRef<number | null>(null);
@@ -244,7 +250,9 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
   }, [liveAudioDrone, demoMidi, f1Effective, f2Effective, f3Effective]);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       studioAudio.stopLiveFormant();
       if (micRafRef.current) cancelAnimationFrame(micRafRef.current);
       if (micStreamRef.current) {
@@ -271,14 +279,17 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
     }
     setMicFftActive(false);
     setMicFftPath("");
-    setSquilloPercent(0);
+    setSquilloDb(null);
   };
 
   const toggleMicFft = async () => {
+    if (micPendingRef.current) return;
     if (micFftActive) {
       stopMicFft();
       return;
     }
+    micPendingRef.current = true;
+    setMicError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -287,6 +298,10 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
           autoGainControl: false,
         },
       });
+      if (!mountedRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       micStreamRef.current = stream;
       const AudioCtx =
         window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -299,6 +314,9 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
       source.connect(analyser);
 
       const freqData = new Uint8Array(analyser.frequencyBinCount);
+      const freqDb = new Float32Array(analyser.frequencyBinCount);
+      const timeData = new Float32Array(analyser.fftSize);
+      let frame = 0;
       setMicFftActive(true);
 
       const width = 460;
@@ -323,22 +341,45 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
         }
         setMicFftPath(pts.join(" "));
 
-        // Compute Singer's Formant / Squillo energy around 2750-3250 Hz
-        const binStart = Math.max(1, Math.floor((2750 / nyquist) * binCount));
-        const binEnd = Math.min(binCount - 1, Math.ceil((3250 / nyquist) * binCount));
-        let sumSquillo = 0;
-        for (let b = binStart; b <= binEnd; b++) {
-          sumSquillo += freqData[b];
+        // Singer's-formant index (like the Singing Power Ratio / alpha ratio):
+        // energy 2–4 kHz relative to 80 Hz–2 kHz, in dB. Independent of overall loudness.
+        // Only computed when the microphone picks up a voice (RMS gate), otherwise null.
+        frame += 1;
+        if (frame % 6 === 0) {
+          analyser.getFloatTimeDomainData(timeData);
+          let sumSq = 0;
+          for (let i = 0; i < timeData.length; i++) sumSq += timeData[i] * timeData[i];
+          const rms = Math.sqrt(sumSq / timeData.length);
+          if (rms < 0.01) {
+            setSquilloDb(null);
+          } else {
+            analyser.getFloatFrequencyData(freqDb);
+            const hzToBin = (hz: number) =>
+              Math.min(binCount - 1, Math.max(0, Math.round((hz / nyquist) * binCount)));
+            let low = 0;
+            let high = 0;
+            for (let b = hzToBin(80); b < hzToBin(2000); b++) low += Math.pow(10, freqDb[b] / 10);
+            for (let b = hzToBin(2000); b <= hzToBin(4000); b++) high += Math.pow(10, freqDb[b] / 10);
+            setSquilloDb(low > 0 && high > 0 ? Math.round(10 * Math.log10(high / low)) : null);
+          }
         }
-        const avgSquillo = sumSquillo / Math.max(1, binEnd - binStart + 1);
-        setSquilloPercent(Math.min(100, Math.round((avgSquillo / 185) * 100)));
 
         micRafRef.current = requestAnimationFrame(updateFft);
       };
 
       micRafRef.current = requestAnimationFrame(updateFft);
-    } catch {
+    } catch (err) {
       stopMicFft();
+      const name = (err as { name?: string })?.name;
+      setMicError(
+        name === "NotAllowedError"
+          ? "Accesso al microfono negato: abilitalo nelle impostazioni del browser."
+          : name === "NotFoundError"
+            ? "Nessun microfono trovato: collega un microfono e riprova."
+            : "Impossibile attivare il microfono."
+      );
+    } finally {
+      micPendingRef.current = false;
     }
   };
 
@@ -474,12 +515,15 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question: trimmed,
-          voiceType: selectedRegisterId.toUpperCase(),
+          voiceType:
+            VOICE_REGISTERS.find((r) => r.id === selectedRegisterId)?.name ??
+            selectedRegisterId,
           lowestNote: lowNoteLabel,
           highestNote: highNoteLabel,
-          recentAccuracy,
+          recentAccuracy: recentAccuracy ?? "non misurato",
         }),
       });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: AiConsultationResponse = await res.json();
       setConsultation(data);
     } catch (err) {
@@ -506,6 +550,11 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
             <h2 className="text-xl font-semibold text-slate-100 mt-0.5">
               Simulatore Interattivo di Laringe, Labbra & Spettro Formantico
             </h2>
+            <p className="text-[11px] text-amber-300/90 mt-1">
+              F1/F2/F3, lunghezza del tratto e curva blu sono un modello simulato (non misurato dalla
+              tua voce). La curva verde è lo spettro live del microfono.
+            </p>
+            {micError && <p className="text-[11px] text-rose-400 mt-1">{micError}</p>}
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -525,7 +574,7 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
               )}
               <span>
                 {micFftActive
-                  ? `Spettro Mic Live: ON (Squillo ${squilloPercent}%)`
+                  ? `Spettro Mic Live: ON (Squillo ${squilloDb === null ? "—" : `${squilloDb} dB`})`
                   : "Spettro Microfono Live (FFT)"}
               </span>
             </button>
@@ -733,7 +782,7 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
                 fontSize="10"
                 fontFamily="IBM Plex Mono"
               >
-                Lunghezza Tratto Vocale: {tractLengthCm} cm
+                Lunghezza Tratto (modello): {tractLengthCm} cm
               </text>
             </svg>
           </div>
@@ -742,7 +791,7 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
           <div className="md:col-span-7 flex flex-col gap-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="text-xs font-semibold text-slate-200">
-                Risposta Spettrale in Tempo Reale (Picchi Formantici F1 e F2)
+                Risposta Spettrale · Modello simulato (blu){micFftActive ? " + Spettro live microfono (verde)" : ""}
               </div>
               <span
                 className={`text-[10px] font-mono font-semibold px-2 py-0.5 rounded border ${
@@ -937,11 +986,15 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
                 </div>
                 <div className="text-[10px] text-slate-400">
                   {micFftActive ? (
-                    <span className="text-emerald-400 font-semibold">
-                      Squillo Mic: {squilloPercent}%
+                    <span
+                      className="text-emerald-400 font-semibold"
+                      title="Energia 2–4 kHz rispetto a 80 Hz–2 kHz, misurata dal microfono"
+                    >
+                      Indice squillo (mic):{" "}
+                      {squilloDb === null ? "— (nessuna voce)" : `${squilloDb} dB`}
                     </span>
                   ) : (
-                    "Squillo / Proiezione"
+                    "Valore del modello simulato"
                   )}
                 </div>
               </div>
@@ -1038,9 +1091,7 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
 
           <div className="bg-slate-950/70 border border-slate-800 rounded-lg p-3.5">
             <div className="flex justify-between text-xs mb-1">
-              <span className="text-slate-200 font-medium">
-                4. Nota & Cupola Palatale ({palateElevation}%)
-              </span>
+              <span className="text-slate-200 font-medium">4. Nota della Demo</span>
               <span className="font-mono tabular-nums text-sky-400 font-semibold">
                 {formatMidiNote(demoMidi).fullLabel}
               </span>
@@ -1052,6 +1103,21 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
               step={1}
               value={demoMidi}
               onChange={(e) => setDemoMidi(Number(e.target.value))}
+              className="w-full h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+            />
+            <div className="flex justify-between text-xs mt-3 mb-1">
+              <span className="text-slate-200 font-medium">5. Cupola Palatale (Velo)</span>
+              <span className="font-mono tabular-nums text-sky-400 font-semibold">
+                {palateElevation}%
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={palateElevation}
+              onChange={(e) => setPalateElevation(Number(e.target.value))}
               className="w-full h-1.5 bg-slate-800 rounded-lg cursor-pointer"
             />
           </div>
@@ -1155,6 +1221,8 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
                 </button>
               </div>
 
+              <AiFallbackNotice show={consultation.isFallback} />
+
               <div className="text-xs text-slate-300 leading-relaxed">
                 <span className="font-semibold text-slate-100">
                   Meccanica Fisiologica:{" "}
@@ -1173,7 +1241,7 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
                 <div className="text-xs font-semibold text-slate-200">
                   Routine Pratica Passo-Passo:
                 </div>
-                {consultation.routineConsigliata.map((item, idx) => (
+                {(consultation.routineConsigliata ?? []).map((item, idx) => (
                   <div
                     key={idx}
                     className="bg-slate-900/90 border border-slate-800 rounded-lg p-3"
@@ -1194,7 +1262,7 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
               <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
                 <span>Ultima Valutazione in Palestra ({lastExerciseTitle})</span>
                 <span className="font-mono text-emerald-400 font-semibold">
-                  Accuratezza: {recentAccuracy}%
+                  Accuratezza: {recentAccuracy === null ? "non misurata" : `${recentAccuracy}%`}
                 </span>
               </div>
               <p className="text-xs text-slate-200 font-medium">
@@ -1203,7 +1271,7 @@ export const AnatomyFormantLab: React.FC<AnatomyFormantLabProps> = ({
               <div className="flex items-center gap-1.5 text-[11px] text-emerald-400 mt-2">
                 <CheckCircle2 className="w-3.5 h-3.5" />
                 <span>
-                  Esercizio assegnato: {lastAnalysis.esercizioCorrettivo.titolo}
+                  Esercizio assegnato: {lastAnalysis.esercizioCorrettivo?.titolo ?? "—"}
                 </span>
               </div>
             </div>

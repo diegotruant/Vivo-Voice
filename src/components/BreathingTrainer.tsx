@@ -12,6 +12,7 @@ import {
   CheckCircle2,
 } from "lucide-react";
 import { studioAudio } from "../utils/audioEngine";
+import { AiFallbackNotice } from "./AiFallbackNotice";
 
 interface BreathPreset {
   id: string;
@@ -86,11 +87,16 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
   // Real-time Microphone "SSS" Hiss Steadiness Coach
   const [micHissActive, setMicHissActive] = useState<boolean>(false);
   const [hissAirflowLevel, setHissAirflowLevel] = useState<number>(0); // 0 to 100
-  const [hissSteadiness, setHissSteadiness] = useState<number>(92);
+  // Steadiness of the "SSS" airflow, measured only during the exhale phase (null = not measured yet)
+  const [hissSteadiness, setHissSteadiness] = useState<number | null>(null);
+  const [measuredExhales, setMeasuredExhales] = useState<number>(0);
+  const [micError, setMicError] = useState<string | null>(null);
   const [coachBreathEvaluation, setCoachBreathEvaluation] = useState<{
     feedbackMaestro: string;
     correzioneTecnica: string;
+    prossimoPasso?: string;
     fraseVocaleCoach: string;
+    isFallback?: boolean;
   } | null>(null);
   const [isAskingCoach, setIsAskingCoach] = useState<boolean>(false);
 
@@ -99,23 +105,59 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const airflowHistoryRef = useRef<number[]>([]);
+  const micPendingRef = useRef<boolean>(false);
+  const mountedRef = useRef<boolean>(true);
+  // Total seconds elapsed in the guided session (kept across pause/resume)
+  const totalElapsedRef = useRef<number>(0);
+  // Current timer position, read by the microphone loop to know when we are in the exhale phase
+  const phaseClockRef = useRef<{ running: boolean; inCycle: number; cycleIndex: number }>({
+    running: false,
+    inCycle: 0,
+    cycleIndex: 1,
+  });
+  // Airflow levels collected during the current exhale window
+  const exhaleSamplesRef = useRef<{ cycleIndex: number; levels: number[] }>({
+    cycleIndex: -1,
+    levels: [],
+  });
 
   const totalCycleSec = inhaleSec + suspendSec + exhaleSec + recoverSec;
 
+  const releaseMic = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+    analyserRef.current = null;
+  };
+
   // Toggle Microphone Hiss Coach
   const toggleMicHissCoach = async () => {
+    if (micPendingRef.current) return;
     if (micHissActive) {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
-      }
+      releaseMic();
       setMicHissActive(false);
       setHissAirflowLevel(0);
       return;
     }
+    micPendingRef.current = true;
+    setMicError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+      if (!mountedRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       streamRef.current = stream;
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       const ctx = new AudioCtx();
@@ -125,18 +167,31 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
       analyser.fftSize = 1024;
       src.connect(analyser);
       analyserRef.current = analyser;
-      airflowHistoryRef.current = [];
+      exhaleSamplesRef.current = { cycleIndex: -1, levels: [] };
+      setHissSteadiness(null);
+      setMeasuredExhales(0);
       setMicHissActive(true);
-    } catch {
+    } catch (err) {
+      releaseMic();
       setMicHissActive(false);
+      const name = (err as { name?: string })?.name;
+      setMicError(
+        name === "NotAllowedError"
+          ? "Accesso al microfono negato: abilitalo nelle impostazioni del browser per misurare la sibilante."
+          : name === "NotFoundError"
+            ? "Nessun microfono trovato: collega un microfono e riprova."
+            : "Impossibile attivare il microfono."
+      );
+    } finally {
+      micPendingRef.current = false;
     }
   };
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-      }
+      mountedRef.current = false;
+      releaseMic();
     };
   }, []);
 
@@ -157,39 +212,68 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
         const level = Math.min(100, Math.round(rms * 420));
         setHissAirflowLevel(level);
 
-        if (level > 8) {
-          airflowHistoryRef.current.push(level);
-          if (airflowHistoryRef.current.length > 90) {
-            airflowHistoryRef.current.shift();
+        // Collect samples only inside the exhale phase, trimming 0.5 s of attack and release.
+        // Every frame in the window counts (dropouts included), so an interrupted hiss scores low.
+        const clock = phaseClockRef.current;
+        const exhaleStart = inhaleSec + suspendSec + 0.5;
+        const exhaleEnd = inhaleSec + suspendSec + exhaleSec - 0.5;
+        const inExhaleWindow =
+          clock.running && clock.inCycle >= exhaleStart && clock.inCycle <= exhaleEnd;
+        const bucket = exhaleSamplesRef.current;
+        if (inExhaleWindow) {
+          if (bucket.cycleIndex !== clock.cycleIndex) {
+            exhaleSamplesRef.current = { cycleIndex: clock.cycleIndex, levels: [] };
           }
-          if (airflowHistoryRef.current.length > 10) {
-            const arr = airflowHistoryRef.current;
-            const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
-            const variance =
-              arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / arr.length;
-            const steadiness = Math.max(
-              50,
-              Math.min(99, Math.round(100 - Math.sqrt(variance) * 1.4))
-            );
-            setHissSteadiness(steadiness);
+          const levels = exhaleSamplesRef.current.levels;
+          levels.push(level);
+          if (levels.length >= 30 && levels.length % 6 === 0) {
+            const mean = levels.reduce((a, b) => a + b, 0) / levels.length;
+            if (mean > 8) {
+              const std = Math.sqrt(
+                levels.reduce((a, b) => a + (b - mean) ** 2, 0) / levels.length
+              );
+              // Coefficient of variation → steadiness (100 = perfectly constant airflow)
+              setHissSteadiness(Math.max(0, Math.round(100 * (1 - std / mean))));
+            }
           }
+        } else if (bucket.cycleIndex !== -1 && bucket.levels.length >= 30) {
+          // Exhale window just ended: count it as measured if the user was actually hissing
+          const mean = bucket.levels.reduce((a, b) => a + b, 0) / bucket.levels.length;
+          if (mean > 8) setMeasuredExhales((n) => n + 1);
+          exhaleSamplesRef.current = { cycleIndex: -1, levels: [] };
         }
       }
       rafId = requestAnimationFrame(monitorAirflow);
     };
     rafId = requestAnimationFrame(monitorAirflow);
     return () => cancelAnimationFrame(rafId);
-  }, [micHissActive]);
+  }, [micHissActive, inhaleSec, suspendSec, exhaleSec]);
+
+  const resetCycleClock = () => {
+    totalElapsedRef.current = 0;
+    lastSecondTickRef.current = -1;
+    phaseClockRef.current = { running: false, inCycle: 0, cycleIndex: 1 };
+    exhaleSamplesRef.current = { cycleIndex: -1, levels: [] };
+    setElapsedInCycle(0);
+    setCycleCount(1);
+  };
+
+  // Changing a phase duration restarts the cycle from the beginning
+  useEffect(() => {
+    resetCycleClock();
+  }, [inhaleSec, suspendSec, exhaleSec, recoverSec]);
 
   useEffect(() => {
     if (!isRunning) return;
     let rafId: number;
-    startMsRef.current = performance.now() - elapsedInCycle * 1000;
+    startMsRef.current = performance.now() - totalElapsedRef.current * 1000;
 
     const tick = (now: number) => {
-      const totalElapsed = (now - startMsRef.current) / 1000;
+      const totalElapsed = Math.max(0, (now - startMsRef.current) / 1000);
+      totalElapsedRef.current = totalElapsed;
       const cycleIndex = Math.floor(totalElapsed / totalCycleSec) + 1;
       const inCycle = totalElapsed % totalCycleSec;
+      phaseClockRef.current = { running: true, inCycle, cycleIndex };
 
       setCycleCount(cycleIndex);
       setElapsedInCycle(inCycle);
@@ -211,19 +295,20 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
     };
 
     rafId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafId);
-  }, [
-    isRunning,
-    totalCycleSec,
-    inhaleSec,
-    suspendSec,
-    exhaleSec,
-    metronomeSound,
-    elapsedInCycle,
-  ]);
+    return () => {
+      cancelAnimationFrame(rafId);
+      phaseClockRef.current = { ...phaseClockRef.current, running: false };
+    };
+  }, [isRunning, totalCycleSec, inhaleSec, suspendSec, exhaleSec, metronomeSound]);
 
   const requestBreathingCoachFeedback = async () => {
     setIsAskingCoach(true);
+    const completedCycles = Math.floor(totalElapsedRef.current / totalCycleSec);
+    const measured = micHissActive || measuredExhales > 0 ? hissSteadiness : null;
+    const details =
+      measured === null
+        ? `Microfono non attivo: stabilità non misurata. Cicli completati: ${completedCycles}.`
+        : `Stabilità del flusso d'aria misurata sulla sibilante durante la fase di emissione: ${measured}% (fasi di emissione misurate: ${measuredExhales}). Cicli completati: ${completedCycles}.`;
     try {
       const res = await fetch("/api/vocal-coach/lesson-coach", {
         method: "POST",
@@ -231,10 +316,11 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
         body: JSON.stringify({
           moduleType: "Respirazione Costo-Diaframmatica & Appoggio",
           exerciseName: `Ciclo ${inhaleSec}s Inspirazione - ${suspendSec}s Appoggio - ${exhaleSec}s Emissione SSS`,
-          scorePercent: hissSteadiness,
-          details: `Stabilità flusso d'aria misurata sulla sibilante: ${hissSteadiness}%. Cicli completati: ${cycleCount}.`,
+          scorePercent: measured ?? "non misurato",
+          details,
         }),
       });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setCoachBreathEvaluation(data);
     } catch (e) {
@@ -432,7 +518,7 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
                   fontWeight="600"
                   fontFamily="IBM Plex Mono"
                 >
-                  Cupola Diaframmatica ({Math.round(phase.expansion * 38)} mm discesa)
+                  Cupola Diaframmatica (modello illustrativo)
                 </text>
               </svg>
             </div>
@@ -450,7 +536,7 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
 
               <div className="bg-slate-950 border border-slate-800 rounded-lg p-3.5 font-mono tabular-nums">
                 <div className="flex justify-between text-xs text-slate-400">
-                  <span>Apertura Intercostale</span>
+                  <span>Apertura Intercostale (modello)</span>
                   <span className="text-sky-400 font-semibold">
                     {Math.round(phase.expansion * 100)}%
                   </span>
@@ -463,9 +549,9 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
                 </div>
 
                 <div className="flex justify-between text-xs text-slate-400 mt-3">
-                  <span>Stabilità Pressione Sottoglottica</span>
+                  <span>Pressione Sottoglottica (indice relativo, modello)</span>
                   <span className="text-emerald-400 font-semibold">
-                    {phase.subglotticPressure} cmH₂O
+                    {phase.subglotticPressure}/100
                   </span>
                 </div>
                 <div className="w-full h-2 bg-slate-900 rounded-full overflow-hidden mt-1.5">
@@ -477,6 +563,10 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
                   />
                 </div>
               </div>
+
+              <p className="text-[10px] text-slate-500 leading-snug">
+                Valori del modello animato che guida il ritmo: non sono misurati dal microfono.
+              </p>
 
               <p className="text-xs text-emerald-200 leading-relaxed bg-emerald-950/30 border border-emerald-500/30 rounded-lg p-3">
                 {phase.coachDirectPrompt}
@@ -508,7 +598,10 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
                 {micHissActive ? (
                   <>
                     <Mic className="w-3.5 h-3.5" />
-                    <span>Microfono Sibilante Attivo (Stabilità: {hissSteadiness}%)</span>
+                    <span>
+                      Microfono Sibilante Attivo (Stabilità:{" "}
+                      {hissSteadiness === null ? "non misurata" : `${hissSteadiness}%`})
+                    </span>
                   </>
                 ) : (
                   <>
@@ -519,19 +612,29 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
               </button>
             </div>
 
+            {micError && <p className="text-[11px] text-rose-400">{micError}</p>}
+
             {micHissActive && (
               <div className="flex flex-col gap-1.5 font-mono text-xs">
                 <div className="flex justify-between text-slate-400">
-                  <span>Pressione Flusso Sibilante Rilevata: {hissAirflowLevel}%</span>
-                  <span
-                    className={
-                      hissSteadiness >= 85 ? "text-emerald-400" : "text-amber-400"
-                    }
-                  >
-                    {hissSteadiness >= 85
-                      ? `● FLUSSO OMOGENEO (${hissSteadiness}%)`
-                      : `▲ FLUSSO OSCILLANTE (${hissSteadiness}%)`}
-                  </span>
+                  <span>Livello Flusso Sibilante (microfono): {hissAirflowLevel}%</span>
+                  {hissSteadiness === null ? (
+                    <span className="text-slate-500">
+                      {isRunning
+                        ? "○ In attesa della fase di emissione…"
+                        : "○ Avvia l'allenamento: si misura durante l'emissione"}
+                    </span>
+                  ) : (
+                    <span
+                      className={
+                        hissSteadiness >= 85 ? "text-emerald-400" : "text-amber-400"
+                      }
+                    >
+                      {hissSteadiness >= 85
+                        ? `● FLUSSO OMOGENEO (${hissSteadiness}%)`
+                        : `▲ FLUSSO OSCILLANTE (${hissSteadiness}%)`}
+                    </span>
+                  )}
                 </div>
                 <div className="w-full h-2.5 bg-slate-900 rounded-full overflow-hidden border border-slate-800">
                   <div
@@ -574,8 +677,7 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
                 type="button"
                 onClick={() => {
                   setIsRunning(false);
-                  setElapsedInCycle(0);
-                  setCycleCount(1);
+                  resetCycleClock();
                 }}
                 className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 whitespace-nowrap shrink-0"
               >
@@ -634,10 +736,17 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
               <p className="text-xs text-slate-200 leading-relaxed">
                 {coachBreathEvaluation.feedbackMaestro}
               </p>
+              <AiFallbackNotice show={coachBreathEvaluation.isFallback} />
               <p className="text-xs text-sky-300 leading-relaxed">
                 <span className="font-semibold">Correzione Posturale: </span>
                 {coachBreathEvaluation.correzioneTecnica}
               </p>
+              {coachBreathEvaluation.prossimoPasso && (
+                <p className="text-xs text-emerald-300 leading-relaxed">
+                  <span className="font-semibold">Prossimo Passo: </span>
+                  {coachBreathEvaluation.prossimoPasso}
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -746,7 +855,7 @@ export const BreathingTrainer: React.FC<BreathingTrainerProps> = ({
                       setSuspendSec(preset.suspendSec);
                       setExhaleSec(preset.exhaleSec);
                       setRecoverSec(preset.recoverSec);
-                      setElapsedInCycle(0);
+                      resetCycleClock();
                     }}
                     className={`p-3 rounded-lg border text-left transition-colors ${
                       isSelected
