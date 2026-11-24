@@ -151,12 +151,20 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
 
   // Load built-in studio backing stems on mount so the user can test immediately or upload their own MP3/WAV
   useEffect(() => {
-    const harmonyBuf = createStudioBackingStemBuffer("harmony", 16);
-    const rhythmBuf = createStudioBackingStemBuffer("rhythm", 16);
-    setBackingBuffer(harmonyBuf);
-    setExtraStemBuffer(rhythmBuf);
-    setTrackDurationSec(harmonyBuf.duration);
+    let cancelled = false;
+    Promise.all([
+      createStudioBackingStemBuffer("harmony"),
+      createStudioBackingStemBuffer("rhythm"),
+    ])
+      .then(([harmonyBuf, rhythmBuf]) => {
+        if (cancelled) return;
+        setBackingBuffer(harmonyBuf);
+        setExtraStemBuffer(rhythmBuf);
+        setTrackDurationSec(harmonyBuf.duration);
+      })
+      .catch((e) => console.error("Failed to render built-in backing stems:", e));
     return () => {
+      cancelled = true;
       stopAllAudio();
     };
   }, []);
@@ -608,7 +616,11 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     setLiveAccuracy(acc);
     setLiveStability(stab);
     setAvgCentsDev(avgC);
-    setVibratoStats(vib);
+    setVibratoStats({
+      rateHz: vib.rateHz,
+      extentCents: vib.extentCents,
+      label: vib.statusLabel,
+    });
     setMinSungNote(lowLabel);
     setMaxSungNote(highLabel);
     setWeakPassages([...weakPassagesRef.current]);
@@ -627,12 +639,10 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     setIsProcessingAudioAi(true);
     try {
       const mastered = await processVocalBufferWithAiMastering(vocalBuf, {
-        pitchCorrectionAmount: 78,
-        formantSquilloBoostDb: 3.5,
-        warmthLowMidDb: 1.8,
+        pitchCorrectionPercent: 78,
+        eqPresenceDb: 3.5,
         compressionRatio: 3.2,
-        reverbWetMix: 0.18,
-        averageCentsError: avgC,
+        reverbWetPercent: 18,
       });
       setCorrectedVocalBuffer(mastered);
       setUseAiCorrectedVocal(true);
@@ -729,12 +739,10 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     setIsProcessingAudioAi(true);
     try {
       const mastered = await processVocalBufferWithAiMastering(testBuf, {
-        pitchCorrectionAmount: 82,
-        formantSquilloBoostDb: 3.5,
-        warmthLowMidDb: 1.8,
+        pitchCorrectionPercent: 82,
+        eqPresenceDb: 3.5,
         compressionRatio: 3.2,
-        reverbWetMix: 0.18,
-        averageCentsError: -9,
+        reverbWetPercent: 18,
       });
       setCorrectedVocalBuffer(mastered);
       setUseAiCorrectedVocal(true);
@@ -749,12 +757,10 @@ export const SongStudioDaw: React.FC<SongStudioDawProps> = ({
     setIsProcessingAudioAi(true);
     try {
       const mastered = await processVocalBufferWithAiMastering(rawVocalBuffer, {
-        pitchCorrectionAmount,
-        formantSquilloBoostDb: squilloBoostDb,
-        warmthLowMidDb: 1.8,
+        pitchCorrectionPercent: pitchCorrectionAmount,
+        eqPresenceDb: squilloBoostDb,
         compressionRatio,
-        reverbWetMix: reverbWetPercent / 100,
-        averageCentsError: avgCentsDev,
+        reverbWetPercent,
       });
       setCorrectedVocalBuffer(mastered);
       setUseAiCorrectedVocal(true);

@@ -290,8 +290,11 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
   // Live microphone or interactive solfege button verification
   const [micEnabled, setMicEnabled] = useState<boolean>(false);
   const [sungSolfegeDegree, setSungSolfegeDegree] = useState<string | null>(null);
-  const [matchedNotesCount, setMatchedNotesCount] = useState<number>(0);
-  const [totalCheckedNotes, setTotalCheckedNotes] = useState<number>(0);
+  // Per-note validation on the staff (clicked or sung in tune) and live cents offset vs. active note
+  const [noteHitMap, setNoteHitMap] = useState<Record<number, "hit">>({});
+  const [liveStaffCents, setLiveStaffCents] = useState<number | null>(null);
+  const noteHitMapRef = useRef<Record<number, "hit">>({});
+  const activeNoteIdxRef = useRef<number>(0);
 
   // Ear Training (Dettato Melodico) mini-game state
   const [earTargetIdx, setEarTargetIdx] = useState<number>(4); // Default Sol
@@ -317,6 +320,20 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
   // Base MIDI for "Do" adapted to user's vocal register octave
   const baseDoMidi = currentRegister.baseExerciseMidi;
 
+  useEffect(() => {
+    noteHitMapRef.current = noteHitMap;
+  }, [noteHitMap]);
+
+  useEffect(() => {
+    activeNoteIdxRef.current = activeNoteIdx;
+  }, [activeNoteIdx]);
+
+  const resetStaffValidation = () => {
+    noteHitMapRef.current = {};
+    setNoteHitMap({});
+    setLiveStaffCents(null);
+  };
+
   const toggleMic = async () => {
     if (micEnabled) {
       if (streamRef.current) {
@@ -325,6 +342,7 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
       }
       setMicEnabled(false);
       setSungSolfegeDegree(null);
+      setLiveStaffCents(null);
       return;
     }
     try {
@@ -363,7 +381,8 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
         analyserRef.current.getFloatTimeDomainData(buf);
         const res = detectPitchAutocorrelation(buf, audioCtxRef.current.sampleRate);
         if (res) {
-          const midi = Math.round(freqToMidiFloat(res.freq));
+          const midiFloat = freqToMidiFloat(res.freq);
+          const midi = Math.round(midiFloat);
           const relSemis = ((midi - baseDoMidi) % 12 + 12) % 12;
           const deg = SOLFEGE_SCALE_DEGREES.find(
             (d) => d.semitone % 12 === relSemis
@@ -371,17 +390,38 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
           if (deg) {
             setSungSolfegeDegree(deg.name);
           }
+
+          // Cents offset vs. the active staff note, folded to the nearest octave
+          // so any voice register can validate the note.
+          const idx = activeNoteIdxRef.current;
+          const target = selectedLesson.notes[idx];
+          if (target) {
+            const targetMidi = baseDoMidi + target.degreeOffset;
+            let diffSemis = (midiFloat - targetMidi) % 12;
+            if (diffSemis > 6) diffSemis -= 12;
+            if (diffSemis < -6) diffSemis += 12;
+            const cents = Math.round(diffSemis * 100);
+            setLiveStaffCents(cents);
+            if (Math.abs(cents) <= 35 && noteHitMapRef.current[idx] !== "hit") {
+              noteHitMapRef.current = { ...noteHitMapRef.current, [idx]: "hit" };
+              setNoteHitMap(noteHitMapRef.current);
+            }
+          }
+        } else {
+          setLiveStaffCents(null);
         }
       }
       rafId = requestAnimationFrame(checkPitch);
     };
     rafId = requestAnimationFrame(checkPitch);
     return () => cancelAnimationFrame(rafId);
-  }, [micEnabled, baseDoMidi]);
+  }, [micEnabled, baseDoMidi, selectedLesson]);
 
   // Solfeggio Playback & Conducting Hand Timer
   useEffect(() => {
     if (!isRunning) return;
+
+    resetStaffValidation();
 
     const beatDurationMs = (60 / bpm) * 1000;
     let currentBeatCounter = 0;
@@ -411,7 +451,9 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
       currentBeatCounter += 1;
       if (currentBeatCounter >= totalBeats) {
         setIsRunning(false);
-        requestMaestroFeedback();
+        const total = selectedLesson.notes.length;
+        const hits = Object.values(noteHitMapRef.current).filter((v) => v === "hit").length;
+        requestMaestroFeedback(micEnabled ? Math.round((hits / total) * 100) : null);
         return;
       }
 
@@ -432,8 +474,6 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
             (n.beats * 60) / bpm * 0.9,
             0.42
           );
-          setTotalCheckedNotes((c) => c + 1);
-          setMatchedNotesCount((m) => m + 1);
         }
       }
     }, beatDurationMs);
@@ -441,22 +481,23 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
     return () => clearInterval(interval);
   }, [isRunning, bpm, selectedLesson, baseDoMidi]);
 
-  const requestMaestroFeedback = async () => {
+  // scorePercent is null when the lesson ran without the microphone (nothing was measured)
+  const requestMaestroFeedback = async (scorePercent: number | null) => {
     setIsRequestingCoach(true);
     try {
-      const score =
-        totalCheckedNotes > 0
-          ? Math.min(98, Math.max(78, Math.round((matchedNotesCount / totalCheckedNotes) * 100)))
-          : 88;
       const res = await fetch("/api/vocal-coach/lesson-coach", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           moduleType: "Solfeggio Cantato & Ritmico",
           exerciseName: selectedLesson.title,
-          scorePercent: score,
+          scorePercent: scorePercent ?? "non misurato",
           voiceType: currentRegister.name,
-          details: `Eseguito a ${bpm} BPM con lettura sul pentagramma e gesto chironomico 4/4.`,
+          details:
+            `Eseguito a ${bpm} BPM con lettura sul pentagramma e gesto chironomico 4/4.` +
+            (scorePercent === null
+              ? " Eseguito senza microfono: intonazione non misurata."
+              : ` Note intonate (entro ±35 cent): ${Math.round((scorePercent / 100) * selectedLesson.notes.length)}/${selectedLesson.notes.length}.`),
         }),
       });
       const data = await res.json();
@@ -963,7 +1004,17 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
 
             <button
               type="button"
-              onClick={requestMaestroFeedback}
+              onClick={() =>
+                requestMaestroFeedback(
+                  micEnabled
+                    ? Math.round(
+                        (Object.values(noteHitMap).filter((v) => v === "hit").length /
+                          selectedLesson.notes.length) *
+                          100
+                      )
+                    : null
+                )
+              }
               disabled={isRequestingCoach}
               className="flex items-center gap-1.5 px-4 py-2.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white whitespace-nowrap shrink-0"
             >
@@ -1047,6 +1098,7 @@ export const SolfeggioCoach: React.FC<SolfeggioCoachProps> = ({
                       setBpm(lesson.bpm);
                       setActiveNoteIdx(0);
                       setCoachFeedback(null);
+                      resetStaffValidation();
                     }}
                     className={`p-3.5 rounded-lg text-left border transition-colors ${
                       active

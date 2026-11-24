@@ -283,7 +283,7 @@ export const VocalProgressSection: React.FC<VocalProgressSectionProps> = ({
                       fontFamily: "IBM Plex Mono, monospace",
                       color: "#F8FAFC",
                     }}
-                    formatter={(value: any, name: string) => [
+                    formatter={(value, name) => [
                       `${value}%`,
                       name === "accuracyPercent"
                         ? "Accuratezza Intonazione"
